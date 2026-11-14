@@ -9,7 +9,8 @@ pub fn write_json(data: &MapData, path: &Path) -> anyhow::Result<()> {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p)?;
     }
-    fs::write(path, serde_json::to_string(data)?)?;
+    // Trailing newline keeps the file stable under the end-of-file-fixer hook.
+    fs::write(path, serde_json::to_string(data)? + "\n")?;
     Ok(())
 }
 
