@@ -20,6 +20,22 @@ Holding local money, meaning local cash or a local-currency stablecoin at par, i
 Peg deviations are ignored. USDT and USDC monthly means stayed within 0.4% of $1 over
 2021-2026; the March 2023 USDC dip is inside one month.
 
+## Crypto assets
+
+BTC, ETH and SOL are quoted in USD stablecoins, so they inherit the stablecoin layer. For a
+holder in country *i*:
+
+```
+PP_asset[i,t] = index_asset[t] × PP[i,USD,t]
+index_asset[t] = VWAP_asset[t] / VWAP_asset[0]
+```
+
+`index_asset` is the asset's USD move. `PP[i,USD,t]` is the stablecoin layer, which depends
+on where the holder spends. VWAP is the monthly volume-weighted price from Binance spot
+monthly klines (quote volume / base volume), to match the monthly-average exchange rates.
+The output stores `index_asset` once, in `assets`. Viewers multiply it by each country's
+USD stablecoin series.
+
 ## Sources
 
 | File | Source | Use |
@@ -29,6 +45,7 @@ Peg deviations are ignored. USDT and USDC monthly means stayed within 0.4% of $1
 | `worldbank/gem_cpi.json` | World Bank GEM `CPTOTNSXN` | CPI for countries BIS does not cover |
 | `worldbank/countries.json` | World Bank country list | ISO3 to ISO2 |
 | `defillama/stablecoins.json` | DefiLlama | circulating supply by peg currency |
+| `binance/{btc,eth,sol}usdt_1M.json` | Binance spot monthly klines | USD price index of each asset |
 
 A country uses BIS CPI when the BIS series starts by the base month and ends within
 3 months of the window end. Otherwise it uses World Bank CPI.

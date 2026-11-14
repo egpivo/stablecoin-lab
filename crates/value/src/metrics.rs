@@ -36,9 +36,18 @@ pub struct CountryRow {
 }
 
 #[derive(Serialize, Debug)]
+pub struct AssetInfo {
+    pub label: String,
+    /// USD price index, base month = 1.00. Purchasing power for holder country i is
+    /// `index × pp["USD"]` of that country: the crypto move times the stablecoin layer.
+    pub index: Vec<Option<f64>>,
+}
+
+#[derive(Serialize, Debug)]
 pub struct MapData {
     pub months: Vec<String>,
     pub pegs: BTreeMap<String, PegInfo>,
+    pub assets: BTreeMap<String, AssetInfo>,
     pub countries: BTreeMap<String, CountryRow>,
     pub excluded: BTreeMap<String, String>,
 }
@@ -48,6 +57,8 @@ pub struct Inputs<'a> {
     pub wb_cpi: &'a Panel,
     pub fx: &'a Panel,
     pub supply: &'a BTreeMap<String, f64>,
+    /// Asset code → monthly USD price.
+    pub assets: &'a BTreeMap<String, crate::fill::Series>,
     pub iso2_to_3: &'a HashMap<String, String>,
 }
 
@@ -187,9 +198,26 @@ pub fn build(inputs: &Inputs, start: Month, end: Month) -> MapData {
             },
         );
     }
+    let mut assets = BTreeMap::new();
+    for &(code, label, _) in config::ASSETS {
+        let Some(series) = inputs.assets.get(code) else {
+            continue;
+        };
+        let prices = fill_(series).values;
+        let ones_vec = vec![Some(1.0); months.len()];
+        let index = ratio_index(&prices, &ones_vec);
+        assets.insert(
+            code.to_string(),
+            AssetInfo {
+                label: label.into(),
+                index: round4(index),
+            },
+        );
+    }
     MapData {
         months: months.iter().map(Month::to_string).collect(),
         pegs,
+        assets,
         countries,
         excluded: config::EXCLUDED
             .iter()
@@ -225,16 +253,20 @@ mod tests {
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
         let supply = BTreeMap::new();
+        let mut assets = BTreeMap::new();
+        assets.insert("BTC".to_string(), flat(s, &[100.0, 200.0]));
         let wb = Panel::new();
         let inputs = Inputs {
             bis_cpi: &bis,
             wb_cpi: &wb,
             fx: &fx,
             supply: &supply,
+            assets: &assets,
             iso2_to_3: &iso,
         };
         let d = build(&inputs, s, s.plus(1));
         let tr = &d.countries["TR"];
+        assert_eq!(d.assets["BTC"].index, vec![Some(1.0), Some(2.0)]);
         assert_eq!(tr.local[1], Some(0.5));
         assert_eq!(tr.pp["USD"][1], Some(1.5)); // 3x FX / 2x prices
         assert_eq!(
@@ -258,6 +290,7 @@ mod tests {
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
         let supply = BTreeMap::new();
+        let assets = BTreeMap::new();
         let wb = Panel::new();
         let d = build(
             &Inputs {
@@ -265,6 +298,7 @@ mod tests {
                 wb_cpi: &wb,
                 fx: &fx,
                 supply: &supply,
+                assets: &assets,
                 iso2_to_3: &iso,
             },
             s,

@@ -47,6 +47,18 @@ impl Month {
         Month::new(y, m)
     }
 
+    /// Milliseconds since 1970-01-01 at 00:00 UTC on the first day of the month.
+    pub fn epoch_millis(self) -> i64 {
+        let (y, m) = (i64::from(self.year()), i64::from(self.month()));
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        (era * 146_097 + doe - 719_468) * 86_400_000
+    }
+
     /// Inclusive range.
     pub fn range(start: Month, end: Month) -> Vec<Month> {
         (start.index..=end.index)
@@ -110,6 +122,9 @@ mod tests {
         assert!("2021-13".parse::<Month>().is_err());
         assert!("2021Q1".parse::<Month>().is_err());
         assert_eq!(civil_from_days(0), (1970, 1));
+        assert_eq!(Month::new(1970, 1).epoch_millis(), 0);
+        assert_eq!(Month::new(2020, 12).epoch_millis(), 1_606_780_800_000);
+        assert_eq!(Month::new(2000, 3).epoch_millis(), 951_868_800_000);
         assert_eq!(civil_from_days(20_406), (2025, 11)); // 2025-11-14
         assert_eq!(civil_from_days(11_016), (2000, 2)); // 2000-02-29
     }
