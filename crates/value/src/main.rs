@@ -74,6 +74,11 @@ fn main() -> anyhow::Result<()> {
             let wb_cpi =
                 sources::parse_wb_indicator(&raw.join("worldbank/gem_cpi.json"), &iso3_to_2)?;
             let supply = sources::parse_defillama_supply(&raw.join("defillama/stablecoins.json"))?;
+            let mut assets = std::collections::BTreeMap::new();
+            for &(code, _, symbol) in stablecoin_value::config::ASSETS {
+                let path = raw.join(format!("binance/{}_1M.json", symbol.to_lowercase()));
+                assets.insert(code.to_string(), sources::parse_binance_monthly(&path)?);
+            }
             let iso2_to_3: HashMap<String, String> = iso3_to_2
                 .iter()
                 .map(|(a, b)| (b.clone(), a.clone()))
@@ -83,6 +88,7 @@ fn main() -> anyhow::Result<()> {
                 wb_cpi: &wb_cpi,
                 fx: &fx,
                 supply: &supply,
+                assets: &assets,
                 iso2_to_3: &iso2_to_3,
             };
             let end = match fixed_end {

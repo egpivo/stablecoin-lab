@@ -12,6 +12,14 @@ pub const PEGS: &[(&str, &str, &str, &str)] = &[
     ("SGD", "Singapore dollar", "peggedSGD", "SG"),
 ];
 
+/// Crypto assets quoted in USD stablecoins: (code, label, Binance spot symbol).
+/// A holder's purchasing power in one is its USD price index times the USD stablecoin layer.
+pub const ASSETS: &[(&str, &str, &str)] = &[
+    ("BTC", "Bitcoin", "BTCUSDT"),
+    ("ETH", "Ether", "ETHUSDT"),
+    ("SOL", "Solana", "SOLUSDT"),
+];
+
 /// Euro members priced in euros for the whole window; their FX is the euro area's (BIS `XM`).
 pub const EURO_MEMBERS: &[&str] = &[
     "AT", "BE", "CY", "DE", "EE", "ES", "FI", "FR", "GR", "HR", "IE", "IT", "LT", "LU", "LV", "MT",

@@ -20,6 +20,7 @@ pub fn url_for(template: &str, start: Month, end: Month) -> String {
             &format!("{}M{:02}", first.year(), first.month()),
         )
         .replace("{end_wb}", &format!("{}M{:02}", end.year(), end.month()))
+        .replace("{start_ms}", &first.epoch_millis().to_string())
 }
 
 pub fn fetch_all(raw_dir: &Path, start: Month, end: Month) -> anyhow::Result<Vec<&'static str>> {
@@ -66,10 +67,10 @@ mod tests {
     #[test]
     fn url_templates_use_the_month_before_the_base() {
         let u = url_for(
-            "a?s={start}&d={start_wb}:{end_wb}",
+            "a?s={start}&d={start_wb}:{end_wb}&t={start_ms}",
             Month::new(2021, 1),
             Month::new(2026, 9),
         );
-        assert_eq!(u, "a?s=2020-12&d=2020M12:2026M09");
+        assert_eq!(u, "a?s=2020-12&d=2020M12:2026M09&t=1606780800000");
     }
 }

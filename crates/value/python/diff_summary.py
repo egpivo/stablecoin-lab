@@ -2,7 +2,7 @@
 
 Usage: python3 crates/value/python/diff_summary.py OLD.json NEW.json
 Lists months added or dropped, countries added or dropped, past values revised by more
-than 0.01, and the latest month's USD stablecoin vs. local money for the largest moves.
+than 0.01, and the latest month's USD stablecoin vs. local currency for the largest moves.
 """
 import json
 import sys
@@ -59,9 +59,9 @@ def main(old_path, new_path):
         rows.append((pp / r["local"][i], area, nm[i], pp, r["local"][i]))
     rows.sort(reverse=True)
     beat = sum(1 for x in rows if x[0] > 1)
-    out.append(f"USD stablecoin beat local money in {beat} of {len(rows)} countries at each one's latest month.")
+    out.append(f"USD stablecoin beat local currency in {beat} of {len(rows)} countries at each one's latest month.")
     out.append("")
-    out.append("| Country | Month | USD stablecoin | Local money | Ratio |")
+    out.append("| Country | Month | USD stablecoin | Local currency | Ratio |")
     out.append("|---|---|---|---|---|")
     for ratio, area, month, pp, loc in rows[:5] + rows[-5:]:
         out.append(f"| {area} | {month} | {pp:.2f} | {loc:.2f} | {ratio:.2f} |")

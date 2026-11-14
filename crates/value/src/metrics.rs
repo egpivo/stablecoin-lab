@@ -7,7 +7,7 @@
 //! LCU_i per c = (LCU_i per USD) / (c per USD)
 //! ```
 //!
-//! Holding local money (cash, or a local-currency stablecoin at par) is `CPI_i[0] / CPI_i[t]`.
+//! Holding local currency (cash, or a local-currency stablecoin at par) is `CPI_i[0] / CPI_i[t]`.
 //! Peg deviations are ignored.
 
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +23,9 @@ use crate::sources::Panel;
 pub struct PegInfo {
     pub label: String,
     pub supply_usd: f64,
+    /// Months where the peg currency's USD rate was filled, not observed. A country's
+    /// value for this peg is estimated if this or the country's own flag is set.
+    pub estimated: Vec<bool>,
 }
 
 #[derive(Serialize, Debug)]
@@ -36,9 +39,18 @@ pub struct CountryRow {
 }
 
 #[derive(Serialize, Debug)]
+pub struct AssetInfo {
+    pub label: String,
+    /// USD price index, base month = 1.00. Purchasing power for holder country i is
+    /// `index × pp["USD"]` of that country: the crypto move times the stablecoin layer.
+    pub index: Vec<Option<f64>>,
+}
+
+#[derive(Serialize, Debug)]
 pub struct MapData {
     pub months: Vec<String>,
     pub pegs: BTreeMap<String, PegInfo>,
+    pub assets: BTreeMap<String, AssetInfo>,
     pub countries: BTreeMap<String, CountryRow>,
     pub excluded: BTreeMap<String, String>,
 }
@@ -48,6 +60,8 @@ pub struct Inputs<'a> {
     pub wb_cpi: &'a Panel,
     pub fx: &'a Panel,
     pub supply: &'a BTreeMap<String, f64>,
+    /// Asset code → monthly USD price.
+    pub assets: &'a BTreeMap<String, crate::fill::Series>,
     pub iso2_to_3: &'a HashMap<String, String>,
 }
 
@@ -103,23 +117,23 @@ pub fn build(inputs: &Inputs, start: Month, end: Month) -> MapData {
     let mut pegs = BTreeMap::new();
     let mut peg_fx: BTreeMap<&str, Vec<Option<f64>>> = BTreeMap::new();
     for &(code, label, peg_type, area) in config::PEGS {
+        let filled = if code == "USD" {
+            ones.clone()
+        } else {
+            inputs.fx.get(area).map(fill_).unwrap_or_else(|| Filled {
+                values: vec![None; months.len()],
+                estimated: vec![false; months.len()],
+            })
+        };
         pegs.insert(
             code.to_string(),
             PegInfo {
                 label: label.into(),
                 supply_usd: *inputs.supply.get(peg_type).unwrap_or(&0.0),
+                estimated: filled.estimated,
             },
         );
-        let fx = if code == "USD" {
-            ones.values.clone()
-        } else {
-            inputs
-                .fx
-                .get(area)
-                .map(|s| fill_(s).values)
-                .unwrap_or_else(|| vec![None; months.len()])
-        };
-        peg_fx.insert(code, fx);
+        peg_fx.insert(code, filled.values);
     }
 
     let mut areas: Vec<&String> = inputs.bis_cpi.keys().chain(inputs.wb_cpi.keys()).collect();
@@ -187,9 +201,26 @@ pub fn build(inputs: &Inputs, start: Month, end: Month) -> MapData {
             },
         );
     }
+    let mut assets = BTreeMap::new();
+    for &(code, label, _) in config::ASSETS {
+        let Some(series) = inputs.assets.get(code) else {
+            continue;
+        };
+        let prices = fill_(series).values;
+        let ones_vec = vec![Some(1.0); months.len()];
+        let index = ratio_index(&prices, &ones_vec);
+        assets.insert(
+            code.to_string(),
+            AssetInfo {
+                label: label.into(),
+                index: round4(index),
+            },
+        );
+    }
     MapData {
         months: months.iter().map(Month::to_string).collect(),
         pegs,
+        assets,
         countries,
         excluded: config::EXCLUDED
             .iter()
@@ -225,16 +256,20 @@ mod tests {
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
         let supply = BTreeMap::new();
+        let mut assets = BTreeMap::new();
+        assets.insert("BTC".to_string(), flat(s, &[100.0, 200.0]));
         let wb = Panel::new();
         let inputs = Inputs {
             bis_cpi: &bis,
             wb_cpi: &wb,
             fx: &fx,
             supply: &supply,
+            assets: &assets,
             iso2_to_3: &iso,
         };
         let d = build(&inputs, s, s.plus(1));
         let tr = &d.countries["TR"];
+        assert_eq!(d.assets["BTC"].index, vec![Some(1.0), Some(2.0)]);
         assert_eq!(tr.local[1], Some(0.5));
         assert_eq!(tr.pp["USD"][1], Some(1.5)); // 3x FX / 2x prices
         assert_eq!(
@@ -243,6 +278,36 @@ mod tests {
         );
         // EUR stablecoin for a Turkish holder: lira per euro triples too (euro flat vs USD).
         assert_eq!(tr.pp["EUR"][1], Some(1.5));
+        assert_eq!(d.pegs["USD"].estimated, vec![false, false]);
+        assert_eq!(d.pegs["EUR"].estimated, vec![false, false]);
+    }
+
+    #[test]
+    fn a_filled_peg_rate_is_flagged_on_the_peg() {
+        let s = Month::new(2021, 1);
+        let mut bis = Panel::new();
+        bis.insert("US".into(), flat(s, &[100.0, 101.0, 102.0]));
+        let mut fx = Panel::new();
+        fx.insert("XM".into(), flat(s, &[0.8, 0.82])); // euro rate missing in month 2
+        let iso: HashMap<String, String> = [("US".to_string(), "USA".to_string())]
+            .into_iter()
+            .collect();
+        let (supply, assets, wb) = (BTreeMap::new(), BTreeMap::new(), Panel::new());
+        let d = build(
+            &Inputs {
+                bis_cpi: &bis,
+                wb_cpi: &wb,
+                fx: &fx,
+                supply: &supply,
+                assets: &assets,
+                iso2_to_3: &iso,
+            },
+            s,
+            s.plus(2),
+        );
+        assert_eq!(d.pegs["EUR"].estimated, vec![false, false, true]);
+        assert!(d.countries["US"].estimated.iter().all(|e| !e));
+        assert!(d.countries["US"].pp["EUR"][2].is_some());
     }
 
     #[test]
@@ -258,6 +323,7 @@ mod tests {
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
         let supply = BTreeMap::new();
+        let assets = BTreeMap::new();
         let wb = Panel::new();
         let d = build(
             &Inputs {
@@ -265,6 +331,7 @@ mod tests {
                 wb_cpi: &wb,
                 fx: &fx,
                 supply: &supply,
+                assets: &assets,
                 iso2_to_3: &iso,
             },
             s,

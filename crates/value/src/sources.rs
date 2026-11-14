@@ -41,6 +41,21 @@ pub const SOURCES: &[Source] = &[
         note: "World Bank country list (ISO3 to ISO2)",
     },
     Source {
+        path: "binance/btcusdt_1M.json",
+        url: "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1M&startTime={start_ms}&limit=1000",
+        note: "Binance spot BTCUSDT monthly klines",
+    },
+    Source {
+        path: "binance/ethusdt_1M.json",
+        url: "https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1M&startTime={start_ms}&limit=1000",
+        note: "Binance spot ETHUSDT monthly klines",
+    },
+    Source {
+        path: "binance/solusdt_1M.json",
+        url: "https://api.binance.com/api/v3/klines?symbol=SOLUSDT&interval=1M&startTime={start_ms}&limit=1000",
+        note: "Binance spot SOLUSDT monthly klines",
+    },
+    Source {
         path: "defillama/stablecoins.json",
         url: "https://stablecoins.llama.fi/stablecoins?includePrices=true",
         note: "DefiLlama stablecoin list with circulating supply by peg type",
@@ -147,6 +162,47 @@ pub fn parse_wb_indicator(
     Ok(panel)
 }
 
+/// Binance monthly klines → monthly volume-weighted average price (quote volume / base
+/// volume), the closest match to the monthly-average exchange rates. A month with no
+/// volume falls back to its close.
+pub fn parse_binance_monthly(path: &Path) -> anyhow::Result<Series> {
+    let rows: Vec<Vec<Value>> = serde_json::from_slice(&std::fs::read(path)?)
+        .with_context(|| format!("{}: not a kline array", path.display()))?;
+    let num = |v: &Value| -> Option<f64> {
+        v.as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| v.as_f64())
+    };
+    let mut series = Series::new();
+    for r in rows {
+        let (Some(open_ms), Some(close), Some(base), Some(quote)) = (
+            r.first().and_then(Value::as_i64),
+            r.get(4).and_then(num),
+            r.get(5).and_then(num),
+            r.get(7).and_then(num),
+        ) else {
+            bail!("{}: malformed kline row", path.display());
+        };
+        let days = open_ms.div_euclid(86_400_000);
+        let m = month_of_days(days);
+        let price = if base > 0.0 { quote / base } else { close };
+        series.insert(m, price);
+    }
+    Ok(series)
+}
+
+fn month_of_days(days: i64) -> Month {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    Month::new(y as i32, m as u32)
+}
+
 /// DefiLlama stablecoin list → circulating USD value per peg type.
 pub fn parse_defillama_supply(path: &Path) -> anyhow::Result<BTreeMap<String, f64>> {
     let doc: Value = serde_json::from_slice(&std::fs::read(path)?)?;
@@ -180,6 +236,17 @@ mod tests {
         assert_eq!(p["JP"].len(), 2);
         assert_eq!(p["JP"][&Month::new(2021, 1)], 103.8);
         assert!(parse_bis_csv(f.path(), None).is_err()); // A and E disagree
+    }
+
+    #[test]
+    fn binance_monthly_klines_give_vwap_per_month() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        // open time 2021-01-01, close 33000, base vol 10, quote vol 300000 -> vwap 30000;
+        // 2021-02-01 with zero volume falls back to the close.
+        write!(f, r#"[[1609459200000,"29000","42000","28000","33000","10",1612137599999,"300000",1,"0","0","0"],[1612137600000,"33000","58000","32000","45000","0",1614556799999,"0",0,"0","0","0"]]"#).unwrap();
+        let s = parse_binance_monthly(f.path()).unwrap();
+        assert_eq!(s[&Month::new(2021, 1)], 30_000.0);
+        assert_eq!(s[&Month::new(2021, 2)], 45_000.0);
     }
 
     #[test]
