@@ -41,7 +41,7 @@ pub(crate) mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "result": format!("0x0000000000000000000000000000000000000000000000000000000000000000")
+                "result": "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
             })))
             .mount(&server)
             .await;
