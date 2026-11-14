@@ -14,7 +14,7 @@ PP[i,c,t] = (LCU_i per c)[t] / (LCU_i per c)[0] × CPI_i[0] / CPI_i[t]
 LCU_i per c = (LCU_i per USD) / (c per USD)
 ```
 
-Holding local money, meaning local cash or a local-currency stablecoin at par, is
+Holding local currency, meaning local cash or a local-currency stablecoin at par, is
 `CPI_i[0] / CPI_i[t]`. The map's second view is the ratio `PP / local`.
 
 Peg deviations are ignored. USDT and USDC monthly means stayed within 0.4% of $1 over

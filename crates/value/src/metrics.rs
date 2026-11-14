@@ -7,7 +7,7 @@
 //! LCU_i per c = (LCU_i per USD) / (c per USD)
 //! ```
 //!
-//! Holding local money (cash, or a local-currency stablecoin at par) is `CPI_i[0] / CPI_i[t]`.
+//! Holding local currency (cash, or a local-currency stablecoin at par) is `CPI_i[0] / CPI_i[t]`.
 //! Peg deviations are ignored.
 
 use std::collections::{BTreeMap, HashMap};

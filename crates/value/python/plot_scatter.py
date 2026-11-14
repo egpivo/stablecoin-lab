@@ -1,4 +1,4 @@
-"""Static scatter: holding local money vs holding a stablecoin, one month, one peg.
+"""Static scatter: holding local currency vs holding a stablecoin, one month, one peg.
 
 Usage: python3 python/plot_scatter.py data/out/purchasing_power.csv --month 2026-09 [--peg USD] --out scatter.png
 Needs pandas and matplotlib.
@@ -42,10 +42,10 @@ def main():
         axis.set_minor_locator(matplotlib.ticker.NullLocator())
     ax.grid(color=GRID, lw=0.8)
     ax.tick_params(labelsize=13, colors=MUTED)
-    ax.set_xlabel(f"Holding local money: purchasing power, Jan 2021 = 1 (log)", fontsize=15, color=INK)
+    ax.set_xlabel(f"Holding local currency: purchasing power, Jan 2021 = 1 (log)", fontsize=15, color=INK)
     ax.set_ylabel(f"Holding a {a.peg} stablecoin (log)", fontsize=15, color=INK)
     above = int((d.pp > d.local).sum())
-    fig.suptitle(f"{a.peg} stablecoin kept more value than local money in {above} of {len(d)} countries",
+    fig.suptitle(f"{a.peg} stablecoin kept more value than local currency in {above} of {len(d)} countries",
                  fontsize=20, x=0.06, ha="left", color=INK)
     fig.tight_layout()
     fig.savefig(a.out)
