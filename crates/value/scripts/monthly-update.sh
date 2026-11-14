@@ -64,6 +64,7 @@ fi
 
 if [[ -n "$DRY_RUN" ]]; then
   cat "$prev.body"
+  git checkout -q -- "$DATA/manifest" "$DATA/out"   # leave the clone clean for the next run
   echo "DRY_RUN: no commit, push or PR"
   exit 0
 fi
