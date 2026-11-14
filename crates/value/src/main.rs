@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use stablecoin_value::month::Month;
-use stablecoin_value::{export, fetch, manifest, metrics, sources};
+use stablecoin_value::{export, fetch, manifest, metrics, sources, window};
 
 #[derive(Parser)]
 #[command(
@@ -19,9 +19,10 @@ struct Cli {
     /// Base month (purchasing power = 1.00).
     #[arg(long, default_value = "2021-01", global = true)]
     start: Month,
-    /// Last month of the panel.
-    #[arg(long, default_value = "2026-09", global = true)]
-    end: Month,
+    /// Last month of the panel, or `auto`: for `fetch` the current month, for `build` the
+    /// latest month at least 80% of countries have published (src/window.rs).
+    #[arg(long, default_value = "auto", global = true)]
+    end: String,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -42,9 +43,14 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let raw = cli.data.join("raw");
     let man = cli.data.join("manifest/raw.sha256");
+    let fixed_end: Option<Month> = match cli.end.as_str() {
+        "auto" => None,
+        text => Some(text.parse()?),
+    };
     match cli.cmd {
         Cmd::Fetch => {
-            let files = fetch::fetch_all(&raw, cli.start, cli.end)?;
+            let end = fixed_end.unwrap_or_else(Month::current_utc);
+            let files = fetch::fetch_all(&raw, cli.start, end)?;
             manifest::write(&raw, &files, &man)?;
             println!("fetched {} files; manifest {}", files.len(), man.display());
         }
@@ -79,7 +85,11 @@ fn main() -> anyhow::Result<()> {
                 supply: &supply,
                 iso2_to_3: &iso2_to_3,
             };
-            let data = metrics::build(&inputs, cli.start, cli.end);
+            let end = match fixed_end {
+                Some(m) => m,
+                None => window::auto_end(&bis_cpi, &fx)?,
+            };
+            let data = metrics::build(&inputs, cli.start, end);
             let out = cli.data.join("out");
             export::write_json(&data, &out.join("map_data.json"))?;
             export::write_csv(&data, &out.join("purchasing_power.csv"))?;
@@ -96,7 +106,7 @@ fn main() -> anyhow::Result<()> {
             println!(
                 "{n} raw files verified; {} countries ({reach} reach {}), {est} with estimated months; excluded: {:?}",
                 data.countries.len(),
-                cli.end,
+                end,
                 data.excluded.keys().collect::<Vec<_>>()
             );
         }

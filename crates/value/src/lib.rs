@@ -12,3 +12,4 @@ pub mod manifest;
 pub mod metrics;
 pub mod month;
 pub mod sources;
+pub mod window;

@@ -32,3 +32,19 @@ copied from another machine. `stablecoin-value build` refuses to run when a raw 
 | `crates/value/python/` | static plots and the parity check against the first prototype |
 
 Method and limits: [METHOD.md](METHOD.md).
+
+## Updates
+
+The site's Lab map reads `crates/value/data/out/map_data.json` from `main`, so merging a
+data PR publishes it. No site deploy is needed.
+
+On the 5th of each month, a systemd user timer on wtwang-wsl runs
+`crates/value/scripts/monthly-update.sh` in a separate clone. The script fetches, builds,
+and opens a pull request titled `data(value): YYYY-MM update` when the pinned data changed.
+The PR body comes from `python/diff_summary.py` and lists the months added and the past
+values revised by more than 0.01. The script never merges.
+
+```bash
+bash crates/value/scripts/install-monthly-timer.sh            # once, on the host
+DRY_RUN=1 bash crates/value/scripts/monthly-update.sh         # build and print the PR body only
+```

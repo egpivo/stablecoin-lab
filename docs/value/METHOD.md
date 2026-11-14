@@ -33,6 +33,14 @@ Peg deviations are ignored. USDT and USDC monthly means stayed within 0.4% of $1
 A country uses BIS CPI when the BIS series starts by the base month and ends within
 3 months of the window end. Otherwise it uses World Bank CPI.
 
+## Window end
+
+`build` uses the latest month that at least 80% of countries have published, for both BIS CPI
+and BIS FX. A country counts if it reported in the 12 months before that month. Prices and
+exchange rates arrive one to two months late, and not all at once. This rule keeps a few
+early reporters from setting the end month (`crates/value/src/window.rs`). Pass `--end YYYY-MM`
+to fix it.
+
 ## Gap rules
 
 - Interior gaps: log-linear interpolation.
