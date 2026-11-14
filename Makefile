@@ -1,4 +1,4 @@
-.PHONY: build fetch pin verify test fmt lint coverage pre-commit parity scatter
+.PHONY: build fetch pin verify test fmt lint pre-commit parity scatter
 
 build:
 	cargo run --release -- build
@@ -21,9 +21,6 @@ fmt:
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
-
-coverage:
-	cargo llvm-cov --workspace --all-features --ignore-filename-regex '(main|fetch)\.rs'
 
 pre-commit:
 	pre-commit run --all-files
