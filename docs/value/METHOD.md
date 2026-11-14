@@ -64,7 +64,7 @@ to fix it.
 - Trailing gap of at most 3 months: extended at the mean of the last 6 monthly log changes.
 - Leading gaps and longer trailing gaps stay empty, and the map shows those months in grey.
 - No value is borrowed from a neighbouring country.
-- Every filled month is flagged `estimated`.
+- Every filled month is flagged `estimated`: on the country (its CPI or USD rate) and, for non-USD pegs, on the peg (its USD rate, `pegs.<code>.estimated`). A country's value for a peg is estimated if either flag is set.
 
 ## Country rules
 

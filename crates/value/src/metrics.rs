@@ -23,6 +23,9 @@ use crate::sources::Panel;
 pub struct PegInfo {
     pub label: String,
     pub supply_usd: f64,
+    /// Months where the peg currency's USD rate was filled, not observed. A country's
+    /// value for this peg is estimated if this or the country's own flag is set.
+    pub estimated: Vec<bool>,
 }
 
 #[derive(Serialize, Debug)]
@@ -114,23 +117,23 @@ pub fn build(inputs: &Inputs, start: Month, end: Month) -> MapData {
     let mut pegs = BTreeMap::new();
     let mut peg_fx: BTreeMap<&str, Vec<Option<f64>>> = BTreeMap::new();
     for &(code, label, peg_type, area) in config::PEGS {
+        let filled = if code == "USD" {
+            ones.clone()
+        } else {
+            inputs.fx.get(area).map(fill_).unwrap_or_else(|| Filled {
+                values: vec![None; months.len()],
+                estimated: vec![false; months.len()],
+            })
+        };
         pegs.insert(
             code.to_string(),
             PegInfo {
                 label: label.into(),
                 supply_usd: *inputs.supply.get(peg_type).unwrap_or(&0.0),
+                estimated: filled.estimated,
             },
         );
-        let fx = if code == "USD" {
-            ones.values.clone()
-        } else {
-            inputs
-                .fx
-                .get(area)
-                .map(|s| fill_(s).values)
-                .unwrap_or_else(|| vec![None; months.len()])
-        };
-        peg_fx.insert(code, fx);
+        peg_fx.insert(code, filled.values);
     }
 
     let mut areas: Vec<&String> = inputs.bis_cpi.keys().chain(inputs.wb_cpi.keys()).collect();
@@ -275,6 +278,36 @@ mod tests {
         );
         // EUR stablecoin for a Turkish holder: lira per euro triples too (euro flat vs USD).
         assert_eq!(tr.pp["EUR"][1], Some(1.5));
+        assert_eq!(d.pegs["USD"].estimated, vec![false, false]);
+        assert_eq!(d.pegs["EUR"].estimated, vec![false, false]);
+    }
+
+    #[test]
+    fn a_filled_peg_rate_is_flagged_on_the_peg() {
+        let s = Month::new(2021, 1);
+        let mut bis = Panel::new();
+        bis.insert("US".into(), flat(s, &[100.0, 101.0, 102.0]));
+        let mut fx = Panel::new();
+        fx.insert("XM".into(), flat(s, &[0.8, 0.82])); // euro rate missing in month 2
+        let iso: HashMap<String, String> = [("US".to_string(), "USA".to_string())]
+            .into_iter()
+            .collect();
+        let (supply, assets, wb) = (BTreeMap::new(), BTreeMap::new(), Panel::new());
+        let d = build(
+            &Inputs {
+                bis_cpi: &bis,
+                wb_cpi: &wb,
+                fx: &fx,
+                supply: &supply,
+                assets: &assets,
+                iso2_to_3: &iso,
+            },
+            s,
+            s.plus(2),
+        );
+        assert_eq!(d.pegs["EUR"].estimated, vec![false, false, true]);
+        assert!(d.countries["US"].estimated.iter().all(|e| !e));
+        assert!(d.countries["US"].pp["EUR"][2].is_some());
     }
 
     #[test]
