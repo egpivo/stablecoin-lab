@@ -1,26 +1,26 @@
 .PHONY: build fetch pin verify test fmt lint pre-commit parity scatter
 
 build:
-	cargo run --release -- build
+	cargo run --release -p stablecoin-value -- build
 
 fetch:
-	cargo run --release -- fetch
+	cargo run --release -p stablecoin-value -- fetch
 
 pin:
-	cargo run --release -- pin
+	cargo run --release -p stablecoin-value -- pin
 
 verify:
-	cargo run --release -- verify
+	cargo run --release -p stablecoin-value -- verify
 
 test:
-	cargo test --all-targets
+	cargo test -p stablecoin-value --all-targets
 
 fmt:
 	cargo fmt --all
 
 lint:
 	cargo fmt --all -- --check
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy -p stablecoin-value --all-targets --all-features -- -D warnings
 
 pre-commit:
 	pre-commit run --all-files

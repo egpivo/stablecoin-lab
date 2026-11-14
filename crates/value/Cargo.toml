@@ -1,16 +1,16 @@
 [package]
-name = "stablecoin-geo-lab"
+name = "stablecoin-value"
 version = "0.1.0"
 edition = "2024"
-description = "Purchasing power of stablecoins by holder country: fetch, panel, gap rules, metrics, export"
+description = "Value layer of stablecoin-lab: purchasing power of stablecoins by holder country: fetch, panel, gap rules, metrics, export"
 license = "MIT"
 
 [lib]
-name = "sgl"
+name = "stablecoin_value"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sgl"
+name = "stablecoin-value"
 path = "src/main.rs"
 
 [dependencies]

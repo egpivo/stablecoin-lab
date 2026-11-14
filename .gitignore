@@ -32,3 +32,9 @@ out/
 # Python
 __pycache__/
 *.pyc
+
+# value layer: raw downloads are pinned by crates/value/data/manifest/raw.sha256
+crates/value/data/raw/
+!crates/value/data/out/
+crates/value/data/out/*.csv
+crates/value/data/out/*.png

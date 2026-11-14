@@ -4,14 +4,17 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-use sgl::month::Month;
-use sgl::{export, fetch, manifest, metrics, sources};
+use stablecoin_value::month::Month;
+use stablecoin_value::{export, fetch, manifest, metrics, sources};
 
 #[derive(Parser)]
-#[command(name = "sgl", about = "Stablecoin purchasing power by holder country")]
+#[command(
+    name = "stablecoin-value",
+    about = "Stablecoin purchasing power by holder country"
+)]
 struct Cli {
     /// Data root holding raw/, manifest/ and out/.
-    #[arg(long, default_value = "data", global = true)]
+    #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/data"), global = true)]
     data: PathBuf,
     /// Base month (purchasing power = 1.00).
     #[arg(long, default_value = "2021-01", global = true)]
@@ -56,8 +59,9 @@ fn main() -> anyhow::Result<()> {
             man.display()
         ),
         Cmd::Build => {
-            let n = manifest::verify(&raw, &man)
-                .context("raw files do not match the manifest; run `sgl fetch` or restore them")?;
+            let n = manifest::verify(&raw, &man).context(
+                "raw files do not match the manifest; run `stablecoin-value fetch` or restore them",
+            )?;
             let bis_cpi = sources::parse_bis_csv(&raw.join("bis/cpi_index.csv"), None)?;
             let fx = sources::parse_bis_csv(&raw.join("bis/fx_monthly.csv"), Some("A"))?;
             let iso3_to_2 = sources::parse_wb_countries(&raw.join("worldbank/countries.json"))?;
