@@ -22,13 +22,15 @@ Peg deviations are ignored. USDT and USDC monthly means stayed within 0.4% of $1
 
 ## Crypto assets
 
-BTC, ETH and SOL are quoted in USD stablecoins, so they inherit the stablecoin layer. For a
+BTC, ETH, SOL and tokenized gold (PAXG) are quoted in USD stablecoins, so they inherit the stablecoin layer. For a
 holder in country *i*:
 
 ```
 PP_asset[i,t] = index_asset[t] × PP[i,USD,t]
 index_asset[t] = VWAP_asset[t] / VWAP_asset[0]
 ```
+
+PAXG tracks one troy ounce of gold, so its index also prices the local basket in gold: the basket costs `1 / PP_PAXG[i,t]` ounces relative to the base month. A gold unit rescales every country by the same factor, so a holder's position relative to a US holder does not change.
 
 `index_asset` is the asset's USD move. `PP[i,USD,t]` is the stablecoin layer, which depends
 on where the holder spends. VWAP is the monthly volume-weighted price from Binance spot
@@ -45,7 +47,7 @@ USD stablecoin series.
 | `worldbank/gem_cpi.json` | World Bank GEM `CPTOTNSXN` | CPI for countries BIS does not cover |
 | `worldbank/countries.json` | World Bank country list | ISO3 to ISO2 |
 | `defillama/stablecoins.json` | DefiLlama | circulating supply by peg currency |
-| `binance/{btc,eth,sol}usdt_1M.json` | Binance spot monthly klines | USD price index of each asset |
+| `binance/{btc,eth,sol,paxg}usdt_1M.json` | Binance spot monthly klines | USD price index of each asset |
 
 A country uses BIS CPI when the BIS series starts by the base month and ends within
 3 months of the window end. Otherwise it uses World Bank CPI.
