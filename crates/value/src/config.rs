@@ -18,6 +18,7 @@ pub const ASSETS: &[(&str, &str, &str)] = &[
     ("BTC", "Bitcoin", "BTCUSDT"),
     ("ETH", "Ether", "ETHUSDT"),
     ("SOL", "Solana", "SOLUSDT"),
+    ("PAXG", "Tokenized gold (PAXG)", "PAXGUSDT"),
 ];
 
 /// Euro members priced in euros for the whole window; their FX is the euro area's (BIS `XM`).

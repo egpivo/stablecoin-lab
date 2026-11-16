@@ -56,6 +56,11 @@ pub const SOURCES: &[Source] = &[
         note: "Binance spot SOLUSDT monthly klines",
     },
     Source {
+        path: "binance/paxgusdt_1M.json",
+        url: "https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=1M&startTime={start_ms}&limit=1000",
+        note: "Binance spot PAXGUSDT monthly klines",
+    },
+    Source {
         path: "defillama/stablecoins.json",
         url: "https://stablecoins.llama.fi/stablecoins?includePrices=true",
         note: "DefiLlama stablecoin list with circulating supply by peg type",
