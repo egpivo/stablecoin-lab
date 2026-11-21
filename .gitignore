@@ -40,6 +40,4 @@ crates/value/data/out/*.csv
 crates/value/data/out/*.png
 
 # Derived research database (rebuilt from panel CSVs; see db/README.md)
-*.sqlite
-*.sqlite.tmp
-*.sqlite-journal
+*.sqlite*

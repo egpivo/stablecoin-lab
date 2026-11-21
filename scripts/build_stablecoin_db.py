@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +34,8 @@ PANELS = {
     "cross_chain_candidates": "cross_chain_candidates_*.csv",
 }
 DATE_COLUMNS = ("date", "week_start_monday")
-SHA256 = re.compile(r"[0-9a-f]{64}")
+# a complete 64-digit hex token, either case; a longer hex run does not count
+SHA256 = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
 
 
 class BuildError(Exception):
@@ -53,7 +55,7 @@ def manifest_hashes(manifests: Path) -> set[str]:
             for value in node:
                 walk(value)
         elif isinstance(node, str):
-            found.update(SHA256.findall(node))
+            found.update(h.lower() for h in SHA256.findall(node))
 
     for path in sorted(manifests.glob("*.json")):
         try:
@@ -81,7 +83,11 @@ def check_types(db: sqlite3.Connection, table: str) -> None:
 def load_panel(db: sqlite3.Connection, table: str, path: Path, hashes: set[str]) -> tuple:
     raw = path.read_bytes()
     sha = hashlib.sha256(raw).hexdigest()
-    rows = list(csv.reader(io.StringIO(raw.decode("utf-8"), newline="")))
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BuildError(f"{table}: {path.name} is not valid UTF-8: {exc}") from exc
+    rows = list(csv.reader(io.StringIO(text, newline="")))
     if not rows:
         raise BuildError(f"{table}: {path.name} is empty")
     header, body = rows[0], rows[1:]
@@ -111,17 +117,25 @@ def build(panels: Path, manifests: Path, out: Path, status: str) -> list[tuple]:
     if status not in ("provisional", "frozen"):
         raise BuildError(f"status must be provisional or frozen, got {status!r}")
     hashes = manifest_hashes(manifests)
-    tmp = out.with_name(out.name + ".tmp")
-    tmp.unlink(missing_ok=True)
+    paths: dict[str, Path] = {}
+    for table, pattern in PANELS.items():
+        matches = sorted(panels.glob(pattern))
+        if len(matches) != 1:
+            raise BuildError(f"{table}: expected one file matching {pattern}, found {len(matches)}")
+        paths[table] = matches[0]
+    inputs = {SCHEMA.resolve(), *(p.resolve() for p in paths.values()), *(p.resolve() for p in manifests.glob("*.json"))}
+    if out.resolve() in inputs:
+        raise BuildError(f"--out {out} is an input file; refusing to overwrite it")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=out.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
     db = sqlite3.connect(tmp)
     report: list[tuple] = []
     try:
         db.executescript(SCHEMA.read_text(encoding="utf-8"))
-        for table, pattern in PANELS.items():
-            matches = sorted(panels.glob(pattern))
-            if len(matches) != 1:
-                raise BuildError(f"{table}: expected one file matching {pattern}, found {len(matches)}")
-            row = load_panel(db, table, matches[0], hashes)
+        for table in PANELS:
+            row = load_panel(db, table, paths[table], hashes)
             db.execute("INSERT INTO dataset VALUES (?,?,?,?,?,?,?,?,?)", (table, *row[:5], row[5], row[6], status))
             report.append((table, *row))
         if status == "frozen":
@@ -147,7 +161,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         report = build(args.panels_dir, args.manifests_dir, args.out, args.status)
-    except BuildError as exc:
+    except (BuildError, OSError, UnicodeError, sqlite3.Error) as exc:
         print(f"build failed: {exc}", file=sys.stderr)
         return 1
     print(f"{'table':32} {'rows':>7} {'hash in manifest':>17}  window")

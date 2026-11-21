@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -151,6 +152,68 @@ class BuildTests(unittest.TestCase):
     def test_unknown_status_is_rejected(self) -> None:
         with self.assertRaises(b.BuildError):
             self.build("final")
+
+    def test_out_that_is_a_panel_is_refused_and_left_intact(self) -> None:
+        panel = next(self.panels.glob("market_daily_*.csv"))
+        before = panel.read_bytes()
+        with self.assertRaisesRegex(b.BuildError, "input file"):
+            b.build(self.panels, self.manifests, panel, "provisional")
+        self.assertEqual(panel.read_bytes(), before)
+
+    def test_out_that_is_the_schema_is_refused_and_left_intact(self) -> None:
+        schema = self.root / "schema.sql"
+        schema.write_text(b.SCHEMA.read_text(encoding="utf-8"), encoding="utf-8")
+        before = schema.read_bytes()
+        with mock.patch.object(b, "SCHEMA", schema):
+            with self.assertRaisesRegex(b.BuildError, "input file"):
+                b.build(self.panels, self.manifests, schema, "provisional")
+        self.assertEqual(schema.read_bytes(), before)
+
+    def test_uppercase_manifest_hash_counts(self) -> None:
+        digest = hashlib.sha256(next(self.panels.glob("issuer_daily_supply_*.csv")).read_bytes()).hexdigest()
+        (self.manifests / "run.json").write_text(json.dumps({"sha": digest.upper()}), encoding="utf-8")
+        self.build()
+        db = sqlite3.connect(self.out)
+        self.assertEqual(db.execute("SELECT sha256_in_manifest FROM dataset WHERE table_name='issuer_daily_supply'").fetchone()[0], 1)
+
+    def test_hash_inside_a_longer_hex_run_does_not_count(self) -> None:
+        digest = hashlib.sha256(next(self.panels.glob("issuer_daily_supply_*.csv")).read_bytes()).hexdigest()
+        (self.manifests / "run.json").write_text(json.dumps({"sha": "a" + digest}), encoding="utf-8")
+        self.build()
+        db = sqlite3.connect(self.out)
+        self.assertEqual(db.execute("SELECT sha256_in_manifest FROM dataset WHERE table_name='issuer_daily_supply'").fetchone()[0], 0)
+
+    def test_non_utf8_panel_fails_with_a_build_error(self) -> None:
+        next(self.panels.glob("market_daily_*.csv")).write_bytes(b"date,series,value\n\xff\xfe,x,1\n")
+        with self.assertRaisesRegex(b.BuildError, "UTF-8"):
+            self.build()
+
+    def test_date_must_be_iso(self) -> None:
+        write_panel(self.panels, "market_daily", rows=["2025/01/01,BTCUSDT_CLOSE,1"])
+        with self.assertRaisesRegex(b.BuildError, "market_daily"):
+            self.build()
+
+    def test_week_flag_and_day_count_are_constrained(self) -> None:
+        for bad in ("2025-01-06,USDT Ethereum,0,0,0,0,1,7,2,1", "2025-01-06,USDT Ethereum,0,0,0,0,1,9,0,1"):
+            write_panel(self.panels, "weekly_mint_burn", rows=[bad])
+            with self.assertRaisesRegex(b.BuildError, "weekly_mint_burn"):
+                self.build()
+
+    def test_same_tx_hash_on_two_chains_is_two_rows(self) -> None:
+        rows = [
+            "USDC,burn,Ethereum,2025-01-01,0xabc,Base,2025-01-01,0xdef,5,0",
+            "USDC,burn,Arbitrum,2025-01-01,0xabc,Base,2025-01-01,0xdef,5,0",
+        ]
+        write_panel(self.panels, "cross_chain_candidates", rows=rows)
+        self.build()
+        db = sqlite3.connect(self.out)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM cross_chain_candidates").fetchone()[0], 2)
+
+    def test_temp_file_does_not_replace_an_unrelated_file(self) -> None:
+        user_file = self.root / "out.sqlite.tmp"
+        user_file.write_bytes(b"mine")
+        self.build()
+        self.assertEqual(user_file.read_bytes(), b"mine")
 
 
 if __name__ == "__main__":
