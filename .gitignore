@@ -38,3 +38,6 @@ crates/value/data/raw/
 !crates/value/data/out/
 crates/value/data/out/*.csv
 crates/value/data/out/*.png
+
+# Derived research database (rebuilt from panel CSVs; see db/README.md)
+*.sqlite*
