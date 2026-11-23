@@ -1452,50 +1452,89 @@ async fn qa_sample_note_survives_first_chunk_outage() {
     }
 }
 
-/// Fault sweep: every fault kind at every call index, then resume; always identical or (for faults
-/// after the manifest commit) a completed run with no refetch.
+/// Fault sweep with EXACT accounting. For every (fault kind, call index) the fault must actually fire
+/// (first run errors), the retry must succeed, and every output file (incl. artifact_manifest.json
+/// and its SHA256 values) must equal the uninterrupted reference byte for byte. One index past the
+/// last call of each kind must NOT fire, which pins the call counts.
+///
+/// Totals: SaveProgress 10, Append 9, TornAppend 9, TmpCreate 13, TmpWrite 13, TmpSync 13,
+/// Rename 13, DirSync 12 = 92. DirSync index 12 (the manifest renamed into place, then an error)
+/// resumes through the completed-chain load path and is in `fault_matrix_dirsync_manifest_commit_case`
+/// (ignored, issue #14), not in these 92.
 #[tokio::test]
 async fn fault_matrix_sweep_recovers_identically() {
     let env = Env::new().await;
     env.bad_mask(0b00_0010_0000);
     let a = uninterrupted("mx_a").await;
-    let ops = [
-        Op::SaveProgress,
-        Op::Append,
-        Op::TornAppend,
-        Op::TmpCreate,
-        Op::TmpWrite,
-        Op::TmpSync,
-        Op::Rename,
-        Op::DirSync,
+    let plan: [(Op, i64); 8] = [
+        (Op::SaveProgress, 10),
+        (Op::Append, 9),
+        (Op::TornAppend, 9),
+        (Op::TmpCreate, 13),
+        (Op::TmpWrite, 13),
+        (Op::TmpSync, 13),
+        (Op::Rename, 13),
+        (Op::DirSync, 12),
     ];
-    let mut identical = 0;
-    for op in ops {
-        for nth in 0i64..13 {
+    let mut total = 0;
+    for (op, calls) in plan {
+        let mut fired = 0;
+        for nth in 0..calls {
             let b = tmp_root(&format!("mx_{op:?}{nth}"));
             seed_manifest(&b, CHUNK);
             let dir = run_dir(&b);
             fault::arm(&dir, op, nth);
             let first = run_scan(&b, CHUNK).await;
             fault::disarm(&dir);
-            if first.is_ok() {
-                continue; // fault index beyond the number of calls of this kind
-            }
+            assert!(
+                first.is_err(),
+                "{op:?} nth={nth}: fault must fire and fail the run"
+            );
             run_scan(&b, CHUNK)
                 .await
                 .unwrap_or_else(|e| panic!("{op:?} nth={nth}: resume: {e:#}"));
-            if op == Op::DirSync && nth == 12 {
-                // manifest renamed into place (chain committed) before the error: this resumes via
-                // the completed-chain load path, whose output divergence is a separate known issue.
-                continue;
-            }
             assert_same_outputs(&run_dir(&a), &run_dir(&b));
-            identical += 1;
+            fired += 1;
             let _ = std::fs::remove_dir_all(&b);
         }
+        // one past the last call of this kind never fires (a DirSync "call 12" is the ignored case)
+        if op != Op::DirSync {
+            let b = tmp_root(&format!("mx_{op:?}_past"));
+            seed_manifest(&b, CHUNK);
+            let dir = run_dir(&b);
+            fault::arm(&dir, op, calls);
+            let r = run_scan(&b, CHUNK).await;
+            fault::disarm(&dir);
+            assert!(
+                r.is_ok(),
+                "{op:?}: index {calls} must be past the last call"
+            );
+            let _ = std::fs::remove_dir_all(&b);
+        }
+        assert_eq!(fired, calls, "{op:?}");
+        total += fired;
     }
-    println!("fault matrix: {identical} faulted runs recovered byte-identically");
-    assert!(identical >= 50);
+    println!("fault matrix: {total} faulted runs recovered byte-identically");
+    assert_eq!(total, 92);
+}
+
+/// DirSync at call index 12: the manifest is renamed into place (chain committed), then the call
+/// errors. Resume goes through the completed-chain load path, whose outputs differ from an
+/// uninterrupted run until egpivo/stablecoin-lab#14 (PR #15) is fixed.
+#[tokio::test]
+#[ignore = "completed-chain load path diverges; fixed by PR #15 / issue #14"]
+async fn fault_matrix_dirsync_manifest_commit_case() {
+    let env = Env::new().await;
+    env.bad_mask(0b00_0010_0000);
+    let a = uninterrupted("mx12_a").await;
+    let b = tmp_root("mx12_b");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    fault::arm(&dir, Op::DirSync, 12);
+    assert!(run_scan(&b, CHUNK).await.is_err(), "fault must fire");
+    fault::disarm(&dir);
+    run_scan(&b, CHUNK).await.expect("resume");
+    assert_same_outputs(&run_dir(&a), &run_dir(&b));
 }
 
 fn diff_names(a: &Path, b: &Path) -> Vec<String> {
@@ -1590,4 +1629,121 @@ async fn completed_chain_real_remove_failure_is_surfaced_and_harmless() {
         "stale checkpoint removed with the checkpoint dir"
     );
     assert!(dir.join("artifact_manifest.json").is_file());
+}
+
+// ---------------------------------------------------------------------------------------------
+// schema v3: chunk_notes is required and consistent with decode_errors
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn schema_v3_round_trips_with_decode_notes() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let root = tmp_root("v3_rt");
+    interrupt_at(&env, &root, FROM + 800).await;
+    let p = load_progress(&root).unwrap().unwrap();
+    assert_eq!(p.schema, "transfer-audit-fetch-chunk-v3");
+    assert_eq!(p.decode_errors, 1);
+    assert_eq!(
+        p.chunk_notes
+            .iter()
+            .filter(|n| n.starts_with("decode: "))
+            .count(),
+        1
+    );
+    ckpt::save_fetch_progress(&run_dir(&root), &p).unwrap();
+    let again = load_progress(&root).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&p).unwrap(),
+        serde_json::to_value(&again).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn schema_v3_rejects_missing_chunk_notes() {
+    let (_env, root) = checkpointed("v3_missing").await;
+    edit_progress(&root, |v| {
+        v.as_object_mut().unwrap().remove("chunk_notes");
+    });
+    let e = err_text(load_progress(&root));
+    assert!(
+        e.contains("chunk_notes") || e.contains("missing field"),
+        "{e}"
+    );
+    assert!(e.contains("--fresh"), "{e}");
+}
+
+#[tokio::test]
+async fn legacy_v2_progress_is_rejected() {
+    let (_env, root) = checkpointed("v3_legacy").await;
+    edit_progress(&root, |v| {
+        v["schema"] = json!("transfer-audit-fetch-chunk-v2")
+    });
+    let e = err_text(load_progress(&root));
+    assert!(
+        e.contains("unsupported fetch progress schema") && e.contains("--fresh"),
+        "{e}"
+    );
+    assert!(e.contains("transfer-audit-fetch-chunk-v3"), "{e}");
+}
+
+#[tokio::test]
+async fn decode_errors_without_decode_notes_are_rejected() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let root = tmp_root("v3_notes_missing");
+    interrupt_at(&env, &root, FROM + 800).await;
+    edit_progress(&root, |v| v["chunk_notes"] = json!([]));
+    let e = err_text(load_progress(&root));
+    assert!(
+        e.contains("decode_errors") && e.contains("chunk_notes"),
+        "{e}"
+    );
+    // and the reverse: fabricated decode notes with no decode errors
+    edit_progress(&root, |v| {
+        v["decode_errors"] = json!(0);
+        v["events_persisted"] = json!(v["logs_fetched"].as_u64().unwrap());
+        v["chunk_notes"] = json!(["decode: invented"]);
+    });
+    let e = err_text(load_progress(&root));
+    assert!(
+        e.contains("decode_errors") && e.contains("chunk_notes"),
+        "{e}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// L1: stale partial data without progress must be cleared or the run must stop
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stale_partial_that_cannot_be_cleared_stops_the_run() {
+    let env = Env::new().await;
+    let a = uninterrupted("l1_a").await;
+    let b = tmp_root("l1_b");
+    interrupt_at(&env, &b, FROM + 500).await;
+    env.fail_from(0);
+    let dir = run_dir(&b);
+    let partial = ckpt::fetch_partial_path(&dir, "ethereum");
+    // stale partial data with NO progress file
+    std::fs::remove_file(ckpt::fetch_progress_path(&dir, "ethereum")).unwrap();
+    assert!(partial.exists());
+    fault::arm(&partial, Op::BlockRemove, 0);
+    env.clear_requests();
+    let first = run_scan(&b, CHUNK).await;
+    fault::disarm(&partial);
+    assert!(first.is_err());
+    let qa = read(&dir.join("qa_report.json"));
+    assert!(
+        qa.contains("fetch_partial_ethereum.csv") && qa.contains("stale"),
+        "{qa}"
+    );
+    assert!(
+        env.state.log_requests.lock().unwrap().is_empty(),
+        "must not start a new fetch on top of stale partial data"
+    );
+    // operator clears the blocker; the retry cleans normally and matches an uninterrupted run
+    std::fs::remove_dir_all(&partial).unwrap();
+    run_scan(&b, CHUNK).await.expect("retry");
+    assert_same_outputs(&run_dir(&a), &run_dir(&b));
 }

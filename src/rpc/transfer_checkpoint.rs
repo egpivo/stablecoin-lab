@@ -296,7 +296,7 @@ pub fn clear_chain_fetch_progress(out_dir: &Path, chain: &str) -> Result<()> {
         fetch_partial_path(out_dir, chain),
     ] {
         #[cfg(test)]
-        if p == fetch_progress_path(out_dir, chain) && fault::hit(&p, fault::Op::BlockRemove) {
+        if fault::hit(&p, fault::Op::BlockRemove) {
             let _ = std::fs::remove_file(&p);
             std::fs::create_dir_all(&p)?;
             std::fs::write(p.join("blocker"), b"x")?;
