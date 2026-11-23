@@ -1547,3 +1547,38 @@ async fn completed_chain_load_path_known_divergence() {
         "outputs diverge on the completed-chain load path: {d:?}"
     );
 }
+
+/// Cleanup failure AFTER the manifest commit with a REAL `remove_file` error (the progress path is a
+/// non-empty directory, which `remove_file` rejects). The earlier `Stage(4)` test fails before the
+/// removal call and so cannot tell "cleanup failed" from "cleanup skipped"; this one can: with the old
+/// `remove_file(..).ok()` the first run would succeed and the `is_err` assertion would fail.
+#[tokio::test]
+async fn completed_chain_real_remove_failure_is_surfaced_and_harmless() {
+    let env = Env::new().await;
+    let b = tmp_root("rm_real");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    let root = ckpt::checkpoint_root(&dir);
+    let prog = ckpt::fetch_progress_path(&dir, "ethereum");
+    fault::arm(&prog, Op::BlockRemove, 0);
+    let first = run_scan(&b, CHUNK).await;
+    fault::disarm(&prog);
+    let e = err_text(first);
+    assert!(
+        e.contains("remove") && e.contains("fetch_progress_ethereum.json"),
+        "{e}"
+    );
+    // (a) the leftover is there and the chain is committed
+    assert!(prog.exists(), "stale progress path left behind");
+    let m = ckpt::load_manifest(&dir).unwrap().unwrap();
+    assert_eq!(m.completed_chains, vec!["ethereum".to_string()]);
+    // (b) resume: chain complete, no refetch; (c) stale leftovers never read, dir cleaned at the end
+    env.clear_requests();
+    run_scan(&b, CHUNK).await.expect("resume");
+    assert!(env.state.log_requests.lock().unwrap().is_empty());
+    assert!(
+        !root.exists(),
+        "stale checkpoint removed with the checkpoint dir"
+    );
+    assert!(dir.join("artifact_manifest.json").is_file());
+}

@@ -182,6 +182,9 @@ pub(crate) mod fault {
         DirSync,
         /// `save_completed_chain` fails before stage k (1 csv, 2 bundle, 3 manifest, 4 cleanup).
         Stage(u8),
+        /// `clear_chain_fetch_progress` finds the progress file replaced by a non-empty directory,
+        /// so the REAL `remove_file` call fails (a failure `.ok()` would have swallowed).
+        BlockRemove,
     }
 
     struct Fault {
@@ -292,6 +295,12 @@ pub fn clear_chain_fetch_progress(out_dir: &Path, chain: &str) -> Result<()> {
         fetch_progress_path(out_dir, chain),
         fetch_partial_path(out_dir, chain),
     ] {
+        #[cfg(test)]
+        if p == fetch_progress_path(out_dir, chain) && fault::hit(&p, fault::Op::BlockRemove) {
+            let _ = std::fs::remove_file(&p);
+            std::fs::create_dir_all(&p)?;
+            std::fs::write(p.join("blocker"), b"x")?;
+        }
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
