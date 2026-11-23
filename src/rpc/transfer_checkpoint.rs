@@ -783,9 +783,23 @@ pub fn append_fetch_partial_events(
     Ok(())
 }
 
-pub fn load_completed_chain(
+/// Keys that must all be present (null allowed) in `supply_unpersisted`; a missing key would otherwise
+/// deserialize silently to `None` and reintroduce the issue #14 divergence.
+const SUPPLY_UNPERSISTED_KEYS: [&str; 5] = [
+    "total_supply_start_raw",
+    "total_supply_end_raw",
+    "total_supply_start_block_timestamp_rfc3339",
+    "window_start_block_timestamp_rfc3339",
+    "window_end_block_timestamp_rfc3339",
+];
+
+/// Load a completed chain and validate it against the ORIGINAL expected task (not the bundle's own
+/// claims): chain, start block, requested end, resolved end (exact when the end was fixed), and every
+/// event's chain and block window. Any mismatch fails closed (`--fresh`); nothing is refetched.
+pub(crate) fn load_completed_chain(
     out_dir: &Path,
     chain: &str,
+    expected: &crate::rpc::transfer_audit::ChainTask,
 ) -> Result<(Vec<TransferEvent>, CheckpointChainBundle)> {
     let csv_path = transfers_path(out_dir, chain);
     let json_path = chain_bundle_path(out_dir, chain);
@@ -815,6 +829,21 @@ pub fn load_completed_chain(
             CHAIN_BUNDLE_SCHEMA
         ),
     }
+    {
+        let unp = raw.get("supply_unpersisted").and_then(|v| v.as_object());
+        let missing: Vec<&str> = SUPPLY_UNPERSISTED_KEYS
+            .iter()
+            .copied()
+            .filter(|k| !unp.is_some_and(|o| o.contains_key(*k)))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "chain bundle {} is missing supply_unpersisted keys {:?}; use --fresh",
+                json_path.display(),
+                missing
+            );
+        }
+    }
     let file: ChainBundleFile = serde_json::from_value(raw).with_context(|| {
         format!(
             "chain bundle {} is truncated, corrupt or missing fields; use --fresh",
@@ -833,6 +862,83 @@ pub fn load_completed_chain(
         supply,
         qa: file.qa,
     };
+    // Validate against the original expected task, not the bundle's own metadata.
+    let s = &bundle.supply;
+    let bad = |what: &str, got: String, want: String| -> anyhow::Error {
+        anyhow::anyhow!(
+            "{}: chain bundle {what} is {got} but this run expects {want}; use --fresh",
+            json_path.display()
+        )
+    };
+    if chain != expected.chain {
+        anyhow::bail!(
+            "load_completed_chain called for {chain:?} with a task for {:?}",
+            expected.chain
+        );
+    }
+    if s.chain != chain {
+        return Err(bad("chain", format!("{:?}", s.chain), format!("{chain:?}")));
+    }
+    if s.from_block != expected.from_block {
+        return Err(bad(
+            "from_block",
+            s.from_block.to_string(),
+            expected.from_block.to_string(),
+        ));
+    }
+    if s.to_block_requested != expected.to_block_requested {
+        return Err(bad(
+            "to_block_requested",
+            format!("{:?}", s.to_block_requested),
+            format!("{:?}", expected.to_block_requested),
+        ));
+    }
+    let Some(resolved) = s.resolved_to_block else {
+        return Err(bad(
+            "resolved_to_block",
+            "absent".into(),
+            "a resolved end block".into(),
+        ));
+    };
+    if let Some(fixed) = expected.fixed_to_block {
+        if resolved != fixed {
+            return Err(bad(
+                "resolved_to_block",
+                resolved.to_string(),
+                fixed.to_string(),
+            ));
+        }
+    }
+    if resolved < expected.from_block {
+        return Err(bad(
+            "resolved_to_block",
+            resolved.to_string(),
+            format!(">= {}", expected.from_block),
+        ));
+    }
+    for e in &events {
+        if e.chain != chain {
+            anyhow::bail!(
+                "{}: event {}#{} has chain {:?}, expected {:?}; use --fresh",
+                csv_path.display(),
+                e.tx_hash,
+                e.log_index,
+                e.chain,
+                chain
+            );
+        }
+        if e.block_number < expected.from_block || e.block_number > resolved {
+            anyhow::bail!(
+                "{}: event {}#{} at block {} is outside the expected window {}..={}; use --fresh",
+                csv_path.display(),
+                e.tx_hash,
+                e.log_index,
+                e.block_number,
+                expected.from_block,
+                resolved
+            );
+        }
+    }
     // Cross-check CSV against the bundle that summarised it.
     if events.len() != bundle.supply.transfer_event_count {
         anyhow::bail!(
@@ -963,6 +1069,21 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    fn task(chain: &str) -> crate::rpc::transfer_audit::ChainTask {
+        crate::rpc::transfer_audit::ChainTask {
+            chain: chain.into(),
+            from_block: 100,
+            to_block_requested: "200".into(),
+            fixed_to_block: Some(200),
+        }
+    }
+
+    fn in_window(chain: &str) -> TransferEvent {
+        let mut e = sample_event(chain);
+        e.block_number = 150;
+        e
     }
 
     fn sample_event(chain: &str) -> TransferEvent {
@@ -1160,10 +1281,11 @@ mod tests {
     fn completed_chain_roundtrip() {
         let out = tmp_out("completed");
         let mut manifest = CheckpointManifest::new("usdc", "run_b", "t0", 500, false, vec![]);
-        let events = vec![sample_event("ethereum")];
+        let events = vec![in_window("ethereum")];
         let bundle = sample_bundle("ethereum");
         save_completed_chain(&out, &mut manifest, "ethereum", &events, &bundle).unwrap();
-        let (loaded_events, _bundle) = load_completed_chain(&out, "ethereum").unwrap();
+        let (loaded_events, _bundle) =
+            load_completed_chain(&out, "ethereum", &task("ethereum")).unwrap();
         assert_eq!(loaded_events.len(), 1);
         assert_eq!(loaded_events[0].chain, "ethereum");
         assert!(manifest.completed_chains.contains(&"ethereum".to_string()));
@@ -1182,9 +1304,9 @@ mod tests {
             Some("2026-01-01T00:00:00Z".into());
         bundle.supply.window_start_block_timestamp_rfc3339 = Some("2026-01-02T00:00:00Z".into());
         bundle.supply.window_end_block_timestamp_rfc3339 = Some("2026-01-03T00:00:00Z".into());
-        let events = vec![sample_event("ethereum")];
+        let events = vec![in_window("ethereum")];
         save_completed_chain(&out, &mut manifest, "ethereum", &events, &bundle).unwrap();
-        let (_, got) = load_completed_chain(&out, "ethereum").unwrap();
+        let (_, got) = load_completed_chain(&out, "ethereum", &task("ethereum")).unwrap();
         let (a, b) = (&bundle.supply, &got.supply);
         assert_eq!(a.total_supply_start_raw, b.total_supply_start_raw);
         assert_eq!(a.total_supply_end_raw, b.total_supply_end_raw);
@@ -1204,12 +1326,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
     }
 
+    fn saved(label: &str, chain: &str) -> (PathBuf, PathBuf) {
+        let out = tmp_out(label);
+        let mut m = CheckpointManifest::new("usdc", "run_m", "t0", 500, false, vec![]);
+        let mut b = sample_bundle(chain);
+        b.supply.total_supply_end_raw = Some("9".into());
+        save_completed_chain(&out, &mut m, chain, &[in_window(chain)], &b).unwrap();
+        let p = chain_bundle_path(&out, chain);
+        (out, p)
+    }
+
+    fn edit_bundle(p: &Path, f: impl FnOnce(&mut serde_json::Value)) {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        f(&mut v);
+        std::fs::write(p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn supply_unpersisted_requires_all_five_keys() {
+        let (out, p) = saved("m1", "ethereum");
+        let ok = |out: &Path| load_completed_chain(out, "ethereum", &task("ethereum"));
+        // all populated / all null round trip
+        assert!(ok(&out).is_ok());
+        edit_bundle(&p, |v| {
+            for k in SUPPLY_UNPERSISTED_KEYS {
+                v["supply_unpersisted"][k] = serde_json::Value::Null;
+            }
+        });
+        let (_, b) = ok(&out).expect("all-null allowed");
+        assert!(b.supply.total_supply_end_raw.is_none());
+        // empty object
+        edit_bundle(&p, |v| v["supply_unpersisted"] = serde_json::json!({}));
+        let e = format!("{:#}", ok(&out).unwrap_err());
+        assert!(
+            e.contains("missing supply_unpersisted keys") && e.contains("--fresh"),
+            "{e}"
+        );
+        // object absent entirely
+        edit_bundle(&p, |v| {
+            v.as_object_mut().unwrap().remove("supply_unpersisted");
+        });
+        assert!(ok(&out).is_err());
+        // each key missing individually
+        for k in SUPPLY_UNPERSISTED_KEYS {
+            edit_bundle(&p, |v| {
+                let mut o = serde_json::Map::new();
+                for kk in SUPPLY_UNPERSISTED_KEYS {
+                    o.insert(kk.into(), serde_json::Value::Null);
+                }
+                o.remove(k);
+                v["supply_unpersisted"] = serde_json::Value::Object(o);
+            });
+            let e = format!("{:#}", ok(&out).unwrap_err());
+            assert!(e.contains(k), "{k}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn completed_chain_validates_against_expected_task() {
+        // valid Ethereum and Base bundles load
+        for chain in ["ethereum", "base"] {
+            let (out, _) = saved(&format!("m2ok_{chain}"), chain);
+            load_completed_chain(&out, chain, &task(chain)).unwrap();
+            let _ = std::fs::remove_dir_all(&out);
+        }
+        type Mutate = Box<dyn Fn(&mut serde_json::Value)>;
+        let cases: Vec<(&str, Mutate, &str)> = vec![
+            (
+                "wrong_chain",
+                Box::new(|v| v["supply"]["chain"] = "base".into()),
+                "bundle chain",
+            ),
+            (
+                "wrong_from",
+                Box::new(|v| v["supply"]["from_block"] = 99.into()),
+                "from_block",
+            ),
+            (
+                "wrong_req_to",
+                Box::new(|v| v["supply"]["to_block_requested"] = "201".into()),
+                "to_block_requested",
+            ),
+            (
+                "wrong_resolved",
+                Box::new(|v| v["supply"]["resolved_to_block"] = 199.into()),
+                "resolved_to_block",
+            ),
+        ];
+        for (label, f, needle) in cases {
+            let (out, p) = saved(&format!("m2_{label}"), "ethereum");
+            edit_bundle(&p, |v| f(v));
+            let e = format!(
+                "{:#}",
+                load_completed_chain(&out, "ethereum", &task("ethereum")).unwrap_err()
+            );
+            assert!(e.contains(needle) && e.contains("--fresh"), "{label}: {e}");
+            let _ = std::fs::remove_dir_all(&out);
+        }
+        // events: wrong chain / outside window (rewrite the transfers CSV, keep bundle consistent)
+        for (label, mutate, needle) in [
+            (
+                "ev_chain",
+                (|e: &mut TransferEvent| e.chain = "base".into()) as fn(&mut TransferEvent),
+                "has chain",
+            ),
+            (
+                "ev_before",
+                |e| e.block_number = 99,
+                "outside the expected window",
+            ),
+            (
+                "ev_after",
+                |e| e.block_number = 201,
+                "outside the expected window",
+            ),
+        ] {
+            let out = tmp_out(&format!("m2_{label}"));
+            let mut m = CheckpointManifest::new("usdc", "run_m", "t0", 500, false, vec![]);
+            let mut ev = in_window("ethereum");
+            mutate(&mut ev);
+            save_completed_chain(&out, &mut m, "ethereum", &[ev], &sample_bundle("ethereum"))
+                .unwrap();
+            let e = format!(
+                "{:#}",
+                load_completed_chain(&out, "ethereum", &task("ethereum")).unwrap_err()
+            );
+            assert!(e.contains(needle), "{label}: {e}");
+            let _ = std::fs::remove_dir_all(&out);
+        }
+    }
+
     /// A v1 bundle (no `bundle_schema`, skipped fields missing) must fail closed with a clear message.
     #[test]
     fn completed_chain_old_unversioned_bundle_fails_closed() {
         let out = tmp_out("oldbundle");
         let mut manifest = CheckpointManifest::new("usdc", "run_o", "t0", 500, false, vec![]);
-        let events = vec![sample_event("ethereum")];
+        let events = vec![in_window("ethereum")];
         save_completed_chain(
             &out,
             &mut manifest,
@@ -1225,7 +1479,10 @@ mod tests {
         v.as_object_mut().unwrap().remove("bundle_schema");
         v.as_object_mut().unwrap().remove("supply_unpersisted");
         std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
-        let e = format!("{:#}", load_completed_chain(&out, "ethereum").unwrap_err());
+        let e = format!(
+            "{:#}",
+            load_completed_chain(&out, "ethereum", &task("ethereum")).unwrap_err()
+        );
         assert!(
             e.contains("schema 1 (unversioned)") && e.contains("--fresh"),
             "{e}"

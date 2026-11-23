@@ -479,7 +479,7 @@ async fn run_inner_at(
     for task in &plan.chain_tasks {
         if completed.contains(&task.chain) {
             let (events, bundle) =
-                transfer_checkpoint::load_completed_chain(&out_dir, &task.chain)?;
+                transfer_checkpoint::load_completed_chain(&out_dir, &task.chain, task)?;
             println!(
                 "[{}] loaded from checkpoint ({} transfers)",
                 task.chain.to_uppercase(),

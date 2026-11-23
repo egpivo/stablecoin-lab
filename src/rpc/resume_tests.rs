@@ -264,6 +264,15 @@ pub(crate) fn tmp_root(label: &str) -> PathBuf {
     p
 }
 
+fn eth_task() -> crate::rpc::transfer_audit::ChainTask {
+    crate::rpc::transfer_audit::ChainTask {
+        chain: "ethereum".into(),
+        from_block: FROM,
+        to_block_requested: TO.to_string(),
+        fixed_to_block: Some(TO),
+    }
+}
+
 pub(crate) fn run_dir(root: &Path) -> PathBuf {
     crate::report::ensure_run_out_dir_at(root, "USDC", RUN_ID).unwrap()
 }
@@ -960,7 +969,7 @@ async fn tampered_completed_chain_checkpoint_fails_closed() {
     assert!(csv_path.is_file(), "ethereum chain checkpoint saved");
 
     // resume reuses it and still reports correct gross sums (value_u256 restored from value_raw)
-    let (events, bundle) = ckpt::load_completed_chain(&dir, "ethereum").unwrap();
+    let (events, bundle) = ckpt::load_completed_chain(&dir, "ethereum", &eth_task()).unwrap();
     let (m_sum, b_sum) = expected_sums();
     assert_eq!(
         events
@@ -975,7 +984,7 @@ async fn tampered_completed_chain_checkpoint_fails_closed() {
     let text = read(&csv_path);
     let lines: Vec<&str> = text.lines().collect();
     std::fs::write(&csv_path, lines[..lines.len() - 1].join("\n") + "\n").unwrap();
-    let e = err_text(ckpt::load_completed_chain(&dir, "ethereum"));
+    let e = err_text(ckpt::load_completed_chain(&dir, "ethereum", &eth_task()));
     assert!(
         e.contains("chain bundle records") && e.contains("--fresh"),
         "{e}"
