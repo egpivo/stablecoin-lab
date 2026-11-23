@@ -18,6 +18,33 @@ pub struct CheckpointChainBundle {
     pub qa: crate::rpc::transfer_audit::QaChain,
 }
 
+/// Current on-disk layout of `chain_<name>.json`. v1 (no `bundle_schema` field) silently dropped the
+/// `#[serde(skip)]` fields of `SupplyAuditRow`, so a resume through the completed-chain load path
+/// produced different `supply_snapshots.csv` / `artifact_manifest.json` (issue #14). v1 bundles are
+/// rejected on load; delete the run's checkpoint (`--fresh`) to redo the chain.
+pub const CHAIN_BUNDLE_SCHEMA: u32 = 2;
+
+/// The `SupplyAuditRow` fields that are `#[serde(skip)]` (kept out of `supply_audit.csv` on purpose) but
+/// feed `supply_snapshots.csv` and `artifact_manifest.json`.
+/// They are persisted next to the row in the chain bundle so the load path restores them exactly.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SupplyUnpersisted {
+    total_supply_start_raw: Option<String>,
+    total_supply_end_raw: Option<String>,
+    total_supply_start_block_timestamp_rfc3339: Option<String>,
+    window_start_block_timestamp_rfc3339: Option<String>,
+    window_end_block_timestamp_rfc3339: Option<String>,
+}
+
+/// Exact on-disk form of a chain bundle (`CheckpointChainBundle` + the skipped supply fields).
+#[derive(Serialize, Deserialize)]
+struct ChainBundleFile {
+    bundle_schema: u32,
+    supply: crate::rpc::transfer_audit::SupplyAuditRow,
+    supply_unpersisted: SupplyUnpersisted,
+    qa: crate::rpc::transfer_audit::QaChain,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainSpecRecord {
     pub chain: String,
@@ -755,15 +782,43 @@ pub fn load_completed_chain(
         );
     }
     let events = read_events_csv(&csv_path)?;
-    let bundle: CheckpointChainBundle = serde_json::from_str(
-        &std::fs::read_to_string(&json_path).with_context(|| json_path.display().to_string())?,
-    )
-    .with_context(|| {
+    let text =
+        std::fs::read_to_string(&json_path).with_context(|| json_path.display().to_string())?;
+    let raw: serde_json::Value = serde_json::from_str(&text).with_context(|| {
+        format!(
+            "chain bundle {} is truncated or corrupt; use --fresh",
+            json_path.display()
+        )
+    })?;
+    match raw.get("bundle_schema").and_then(|v| v.as_u64()) {
+        Some(v) if v == u64::from(CHAIN_BUNDLE_SCHEMA) => {}
+        found => anyhow::bail!(
+            "chain bundle {} has schema {} but this build needs {}; it was written by an older \
+             version that did not persist supply timestamps/raw supply, so resuming from it would \
+             produce different outputs. Re-run with --fresh to redo this chain",
+            json_path.display(),
+            found.map_or_else(|| "1 (unversioned)".to_string(), |v| v.to_string()),
+            CHAIN_BUNDLE_SCHEMA
+        ),
+    }
+    let file: ChainBundleFile = serde_json::from_value(raw).with_context(|| {
         format!(
             "chain bundle {} is truncated, corrupt or missing fields; use --fresh",
             json_path.display()
         )
     })?;
+    let mut supply = file.supply;
+    let x = file.supply_unpersisted;
+    supply.total_supply_start_raw = x.total_supply_start_raw;
+    supply.total_supply_end_raw = x.total_supply_end_raw;
+    supply.total_supply_start_block_timestamp_rfc3339 =
+        x.total_supply_start_block_timestamp_rfc3339;
+    supply.window_start_block_timestamp_rfc3339 = x.window_start_block_timestamp_rfc3339;
+    supply.window_end_block_timestamp_rfc3339 = x.window_end_block_timestamp_rfc3339;
+    let bundle = CheckpointChainBundle {
+        supply,
+        qa: file.qa,
+    };
     // Cross-check CSV against the bundle that summarised it.
     if events.len() != bundle.supply.transfer_event_count {
         anyhow::bail!(
@@ -817,7 +872,28 @@ pub fn save_completed_chain(
         anyhow::bail!("injected failure at completed-chain stage 2 (chain bundle)");
     }
     let json_path = chain_bundle_path(out_dir, chain);
-    write_atomic(&json_path, serde_json::to_string_pretty(bundle)?.as_bytes())?;
+    let file = ChainBundleFile {
+        bundle_schema: CHAIN_BUNDLE_SCHEMA,
+        supply: bundle.supply.clone(),
+        supply_unpersisted: SupplyUnpersisted {
+            total_supply_start_raw: bundle.supply.total_supply_start_raw.clone(),
+            total_supply_end_raw: bundle.supply.total_supply_end_raw.clone(),
+            total_supply_start_block_timestamp_rfc3339: bundle
+                .supply
+                .total_supply_start_block_timestamp_rfc3339
+                .clone(),
+            window_start_block_timestamp_rfc3339: bundle
+                .supply
+                .window_start_block_timestamp_rfc3339
+                .clone(),
+            window_end_block_timestamp_rfc3339: bundle
+                .supply
+                .window_end_block_timestamp_rfc3339
+                .clone(),
+        },
+        qa: bundle.qa.clone(),
+    };
+    write_atomic(&json_path, serde_json::to_string_pretty(&file)?.as_bytes())?;
     #[cfg(test)]
     if fault::hit(&root, fault::Op::Stage(3)) {
         anyhow::bail!("injected failure at completed-chain stage 3 (manifest)");
@@ -1071,6 +1147,69 @@ mod tests {
         assert_eq!(loaded_events.len(), 1);
         assert_eq!(loaded_events[0].chain, "ethereum");
         assert!(manifest.completed_chains.contains(&"ethereum".to_string()));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Every `#[serde(skip)]` field of `SupplyAuditRow` must survive save -> load (issue #14).
+    #[test]
+    fn completed_chain_roundtrip_preserves_serde_skip_supply_fields() {
+        let out = tmp_out("skipfields");
+        let mut manifest = CheckpointManifest::new("usdc", "run_s", "t0", 500, false, vec![]);
+        let mut bundle = sample_bundle("ethereum");
+        bundle.supply.total_supply_start_raw = Some("111".into());
+        bundle.supply.total_supply_end_raw = Some("222".into());
+        bundle.supply.total_supply_start_block_timestamp_rfc3339 =
+            Some("2026-01-01T00:00:00Z".into());
+        bundle.supply.window_start_block_timestamp_rfc3339 = Some("2026-01-02T00:00:00Z".into());
+        bundle.supply.window_end_block_timestamp_rfc3339 = Some("2026-01-03T00:00:00Z".into());
+        let events = vec![sample_event("ethereum")];
+        save_completed_chain(&out, &mut manifest, "ethereum", &events, &bundle).unwrap();
+        let (_, got) = load_completed_chain(&out, "ethereum").unwrap();
+        let (a, b) = (&bundle.supply, &got.supply);
+        assert_eq!(a.total_supply_start_raw, b.total_supply_start_raw);
+        assert_eq!(a.total_supply_end_raw, b.total_supply_end_raw);
+        assert_eq!(
+            a.total_supply_start_block_timestamp_rfc3339,
+            b.total_supply_start_block_timestamp_rfc3339
+        );
+        assert_eq!(
+            a.window_start_block_timestamp_rfc3339,
+            b.window_start_block_timestamp_rfc3339
+        );
+        assert_eq!(
+            a.window_end_block_timestamp_rfc3339,
+            b.window_end_block_timestamp_rfc3339
+        );
+        assert_eq!(b.total_supply_end_raw.as_deref(), Some("222"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// A v1 bundle (no `bundle_schema`, skipped fields missing) must fail closed with a clear message.
+    #[test]
+    fn completed_chain_old_unversioned_bundle_fails_closed() {
+        let out = tmp_out("oldbundle");
+        let mut manifest = CheckpointManifest::new("usdc", "run_o", "t0", 500, false, vec![]);
+        let events = vec![sample_event("ethereum")];
+        save_completed_chain(
+            &out,
+            &mut manifest,
+            "ethereum",
+            &events,
+            &sample_bundle("ethereum"),
+        )
+        .unwrap();
+        // rewrite as the legacy layout: just {supply, qa}
+        let p = chain_bundle_path(&out, "ethereum");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("bundle_schema");
+        v.as_object_mut().unwrap().remove("supply_unpersisted");
+        std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        let e = format!("{:#}", load_completed_chain(&out, "ethereum").unwrap_err());
+        assert!(
+            e.contains("schema 1 (unversioned)") && e.contains("--fresh"),
+            "{e}"
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 }

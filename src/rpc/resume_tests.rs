@@ -122,6 +122,9 @@ pub(crate) struct MockState {
     pub bad_only: AtomicU64,
     /// Bit i set -> chunk i (counting from FROM, CHUNK blocks each) returns ONLY a malformed log.
     pub bad_mask: AtomicU64,
+    /// When true, `eth_getBlockByNumber` returns a block with a deterministic timestamp (otherwise null,
+    /// so every block timestamp is absent from the outputs).
+    pub block_ts: std::sync::atomic::AtomicBool,
     /// Every `(fromBlock, toBlock, succeeded)` requested via `eth_getLogs`, in order.
     pub log_requests: Mutex<Vec<(u64, u64, bool)>>,
 }
@@ -144,7 +147,34 @@ impl Respond for Responder {
         match body["method"].as_str().unwrap() {
             "eth_chainId" => ok(json!("0x1")),
             "eth_blockNumber" => ok(json!(format!("0x{TO:x}"))),
-            "eth_getBlockByNumber" => ok(Value::Null),
+            "eth_getBlockByNumber" => {
+                if !self.0.block_ts.load(Ordering::SeqCst) {
+                    return ok(Value::Null);
+                }
+                let n = hex_u64(&params[0]);
+                let z32 = format!("0x{:064x}", 0);
+                ok(json!({
+                    "hash": format!("0x{n:064x}"),
+                    "parentHash": z32,
+                    "sha3Uncles": z32,
+                    "miner": ZERO,
+                    "stateRoot": z32,
+                    "transactionsRoot": z32,
+                    "receiptsRoot": z32,
+                    "logsBloom": format!("0x{:0512x}", 0),
+                    "difficulty": "0x0",
+                    "number": format!("0x{n:x}"),
+                    "gasLimit": "0x1c9c380",
+                    "gasUsed": "0x0",
+                    "timestamp": format!("0x{:x}", (1_700_000_000i64 + (n as i64 - FROM as i64) * 12)),
+                    "extraData": "0x",
+                    "mixHash": z32,
+                    "nonce": "0x0000000000000000",
+                    "size": "0x100",
+                    "uncles": [],
+                    "transactions": [],
+                }))
+            }
             "eth_call" => {
                 let input = params[0]
                     .get("input")
@@ -216,6 +246,7 @@ pub(crate) async fn spawn_mock() -> (MockServer, Arc<MockState>) {
         fail_from: AtomicU64::new(0),
         bad_only: AtomicU64::new(0),
         bad_mask: AtomicU64::new(0),
+        block_ts: std::sync::atomic::AtomicBool::new(false),
         log_requests: Mutex::new(Vec::new()),
     });
     let server = MockServer::start().await;
@@ -344,6 +375,9 @@ impl Env {
             .collect();
         v.sort();
         v
+    }
+    fn block_ts(&self) {
+        self.state.block_ts.store(true, Ordering::SeqCst);
     }
     fn bad_mask(&self, m: u64) {
         self.state.bad_mask.store(m, Ordering::SeqCst);
@@ -1368,8 +1402,7 @@ async fn completed_chain_failure_before_each_stage_then_resume() {
 }
 
 /// Cleanup failure AFTER the manifest commit: the chain is complete, resume must not refetch and
-/// must finish. (Byte-equality of ALL outputs on the completed-chain load path is a separate,
-/// pre-existing problem tracked in the follow-up issue; see `completed_chain_load_path_known_divergence`.)
+/// must finish. (Byte-equality on the load path: see completed_chain_load_path_is_byte_identical.)
 #[tokio::test]
 async fn completed_chain_cleanup_failure_after_manifest_commit() {
     let env = Env::new().await;
@@ -1484,11 +1517,6 @@ async fn fault_matrix_sweep_recovers_identically() {
             run_scan(&b, CHUNK)
                 .await
                 .unwrap_or_else(|e| panic!("{op:?} nth={nth}: resume: {e:#}"));
-            if op == Op::DirSync && nth == 12 {
-                // manifest renamed into place (chain committed) before the error: this resumes via
-                // the completed-chain load path, whose output divergence is a separate known issue.
-                continue;
-            }
             assert_same_outputs(&run_dir(&a), &run_dir(&b));
             identical += 1;
             let _ = std::fs::remove_dir_all(&b);
@@ -1511,41 +1539,43 @@ fn diff_names(a: &Path, b: &Path) -> Vec<String> {
     out
 }
 
-/// KNOWN ISSUE, not fixed in this PR: when a run resumes through the completed-chain LOAD path
-/// (chain already committed in the manifest), outputs derived from `#[serde(skip)]` fields of
-/// `SupplyAuditRow` (e.g. supply_snapshots.csv) differ from an uninterrupted run. Run explicitly with
-/// `cargo test -- --ignored completed_chain_load_path_known_divergence`.
+/// Issue #14 regression: a run resumed through the completed-chain LOAD path must be byte-identical to
+/// an uninterrupted run (every file: supply_snapshots.csv, artifact_manifest.json and its SHA256 entries).
+/// Block timestamps are served in the second pass so the timestamp-derived fields are populated too.
 #[tokio::test]
-#[ignore = "known pre-existing issue in the completed-chain load path; tracked in egpivo/stablecoin-lab#14"]
-async fn completed_chain_load_path_known_divergence() {
-    let env = Env::new().await;
-    env.bad_only(BAD_CHUNK);
-    let a = uninterrupted("kd_a").await;
-    let b = tmp_root("kd_b");
-    seed_manifest(&b, CHUNK);
-    let dir = run_dir(&b);
-    let root = ckpt::checkpoint_root(&dir);
-    fault::arm(&root, Op::Stage(4), 0);
-    assert!(run_scan(&b, CHUNK).await.is_err());
-    fault::disarm(&root);
-    run_scan(&b, CHUNK).await.expect("resume");
-    let d = diff_names(&run_dir(&a), &dir);
-    println!("KNOWN-DIVERGENCE diffs: {d:?}");
-    println!(
-        "uninterrupted supply_snapshots.csv:\n{}",
-        read(&run_dir(&a).join("supply_snapshots.csv"))
-    );
-    println!(
-        "resumed supply_snapshots.csv ({} bytes):\n{}",
-        std::fs::metadata(dir.join("supply_snapshots.csv"))
-            .unwrap()
-            .len(),
-        read(&dir.join("supply_snapshots.csv"))
-    );
-    assert!(
-        d.is_empty(),
-        "outputs diverge on the completed-chain load path: {d:?}"
-    );
+async fn completed_chain_load_path_is_byte_identical() {
+    for with_ts in [false, true] {
+        let env = Env::new().await;
+        env.bad_only(BAD_CHUNK);
+        if with_ts {
+            env.block_ts();
+        }
+        let a = uninterrupted(&format!("cl_a{with_ts}")).await;
+        let b = tmp_root(&format!("cl_b{with_ts}"));
+        seed_manifest(&b, CHUNK);
+        let dir = run_dir(&b);
+        let root = ckpt::checkpoint_root(&dir);
+        fault::arm(&root, Op::Stage(4), 0);
+        assert!(run_scan(&b, CHUNK).await.is_err());
+        fault::disarm(&root);
+        env.clear_requests();
+        run_scan(&b, CHUNK).await.expect("resume");
+        assert!(
+            env.state.log_requests.lock().unwrap().is_empty(),
+            "must resume via the load path (no refetch)"
+        );
+        let snap = read(&dir.join("supply_snapshots.csv"));
+        assert!(snap.lines().count() >= 3, "snapshots not empty: {snap:?}");
+        if with_ts {
+            assert!(
+                snap.contains("2023-11-15T01:33:08Z"),
+                "timestamps present: {snap}"
+            );
+        }
+        let d = diff_names(&run_dir(&a), &dir);
+        assert!(d.is_empty(), "outputs diverge on the load path: {d:?}");
+        assert_same_outputs(&run_dir(&a), &dir);
+    }
 }
 
 /// Cleanup failure AFTER the manifest commit with a REAL `remove_file` error (the progress path is a
