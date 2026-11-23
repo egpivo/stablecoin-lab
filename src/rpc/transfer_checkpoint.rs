@@ -86,7 +86,6 @@ pub struct FetchChunkProgress {
     pub unresolved: Option<UnresolvedInterval>,
     /// Chunk-derived QA notes (decode QA sample + first decode errors), in order, so a resumed run
     /// reports the same `qa_report.json` / manifest warnings as an uninterrupted one.
-    #[serde(default)]
     pub chunk_notes: Vec<String>,
 }
 
@@ -99,9 +98,10 @@ pub struct UnresolvedInterval {
 }
 
 impl FetchChunkProgress {
-    /// v2: adds `events_persisted`, `decode_errors`, `unresolved`; partial CSV rows are validated and
+    /// v3 (v2 files are rejected, no migration): `chunk_notes` is a required field and must agree with
+    /// `decode_errors`. v2 added `events_persisted`, `decode_errors`, `unresolved`; partial CSV rows are validated and
     /// `value_u256` is restored from `value_raw` on load. v1 progress files are rejected (fail closed).
-    pub const SCHEMA: &'static str = "transfer-audit-fetch-chunk-v2";
+    pub const SCHEMA: &'static str = "transfer-audit-fetch-chunk-v3";
 
     pub fn resume_from_block(&self) -> u64 {
         self.last_fetched_through.saturating_add(1)
@@ -507,6 +507,20 @@ fn validate_progress_consistency(p: &FetchChunkProgress, path: &Path) -> Result<
         return bad(format!(
             "events_persisted {} + decode_errors {} != logs_fetched {}",
             p.events_persisted, p.decode_errors, p.logs_fetched
+        ));
+    }
+    // The first five decode errors each contribute one "decode: ..." note; nothing may be missing
+    // or invented (the QA notes are restored verbatim on resume).
+    let decode_notes = p
+        .chunk_notes
+        .iter()
+        .filter(|n| n.starts_with("decode: "))
+        .count() as u64;
+    if decode_notes != p.decode_errors.min(5) {
+        return bad(format!(
+            "decode_errors {} requires {} \"decode: \" entries in chunk_notes, found {decode_notes}",
+            p.decode_errors,
+            p.decode_errors.min(5)
         ));
     }
     if let Some(u) = &p.unresolved {

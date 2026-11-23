@@ -1199,7 +1199,33 @@ pub(crate) async fn process_chain(
 
     if fetch_progress.is_none() && transfer_checkpoint::fetch_partial_path(out_dir, chain).exists()
     {
-        transfer_checkpoint::clear_chain_fetch_progress(out_dir, chain).ok();
+        // Stale partial rows without a valid progress file: clear them or stop. Never fetch on top.
+        if let Err(e) = transfer_checkpoint::clear_chain_fetch_progress(out_dir, chain) {
+            let msg = format!(
+                "cannot clear stale partial fetch data (no valid progress for this chain); refusing to start a new fetch on top of it: {e:#}"
+            );
+            eprintln!("[{}] {msg}", chain.to_uppercase());
+            errors.push(msg);
+            let supply = partial_supply_after_fetch_fail(
+                chain,
+                &config,
+                from_block,
+                end_blk,
+                to_block_raw,
+                chunk_size,
+                metadata_call_pass,
+                historical_supply_pass,
+                &supply_start,
+                &supply_start_provenance,
+                &supply_end,
+                effective_decimals,
+                &win_start_ts,
+                &win_end_ts,
+                start_supply_block_ts.clone(),
+            );
+            let qa = build_qa_chain(&supply, generated_at, &errors);
+            return (empty_events, supply, qa, true);
+        }
     }
 
     let fetch_already_done = fetch_progress.as_ref().is_some_and(|p| p.is_complete());

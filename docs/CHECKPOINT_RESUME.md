@@ -35,16 +35,27 @@ redoes only the tail. A failure at (4) is still a hard error, but its message st
 is already committed and that retrying recognizes the chain as complete without refetching; the stale
 progress files are never read and are removed with the checkpoint directory when the run succeeds.
 
-## Compatibility: fetch progress schema v1 -> v2
+## Compatibility: fetch progress schema (current: v3)
 
-`transfer-audit-fetch-chunk-v1` progress files are **not** readable by this version. Resuming an
-in-flight v1 checkpoint fails with `unsupported fetch progress schema ... use --fresh`. Finish such a
-run with the old binary, or restart it with `--fresh` (re-fetches that chain). Completed-chain
-checkpoints (`transfers_<chain>.csv`, `chain_<chain>.json`, `manifest.json`) keep their schema, but
-completed-chain CSVs are now cross-checked against their bundle (row count, mint/burn sums).
-v2 adds `events_persisted`, `decode_errors`, `unresolved` and `chunk_notes`.
+The fetch progress schema is `transfer-audit-fetch-chunk-v3`. Older progress files (`-v1`, `-v2`) are
+**not** readable and there is no migration: resuming one fails with
+`unsupported fetch progress schema ... use --fresh`. Finish such a run with the build that wrote it,
+or restart it with `--fresh` (re-fetches that chain). Rationale for no v2 migration: v2 allowed
+`chunk_notes` to be silently absent, so the QA notes of a resumed run could not be reconstructed and
+fabricating them would break byte-equality with an uninterrupted run.
+
+v3 requires `chunk_notes` (no default) and validates it against `decode_errors`: the number of
+`"decode: ..."` entries must equal `min(decode_errors, 5)`; missing or invented entries fail closed.
+Other v3 validation: `events_persisted + decode_errors == logs_fetched`, chunk-boundary and counter
+consistency, window/contract match.
+
+Completed-chain checkpoints (`transfers_<chain>.csv`, `chain_<chain>.json`, `manifest.json`) keep their
+schema, but completed-chain CSVs are cross-checked against their bundle (row count, mint/burn sums).
 Runs finished with the old resume code are not repaired; re-run or flag any whose supply invariant
 failed after a resume.
+
+Stale partial rows with no valid progress file are cleared before a fresh fetch; if they cannot be
+cleared the run stops with an error naming the path (it never fetches on top of them).
 
 ## Known issue
 
