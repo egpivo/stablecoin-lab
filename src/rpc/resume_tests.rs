@@ -1406,6 +1406,7 @@ async fn completed_chain_failure_before_each_stage_then_resume() {
 #[tokio::test]
 async fn completed_chain_cleanup_failure_after_manifest_commit() {
     let env = Env::new().await;
+    let a = uninterrupted("st_cleanup_a").await;
     let b = tmp_root("st_cleanup");
     seed_manifest(&b, CHUNK);
     let dir = run_dir(&b);
@@ -1433,6 +1434,8 @@ async fn completed_chain_cleanup_failure_after_manifest_commit() {
         !root.exists(),
         "checkpoint dir cleared after a successful run"
     );
+    // issue #14 fixed: the load path reproduces the uninterrupted outputs exactly
+    assert_same_outputs(&run_dir(&a), &dir);
 }
 
 /// Mid-write failures inside each completed-chain write (tmp / rename / dir fsync) then resume.
@@ -1493,7 +1496,7 @@ async fn qa_sample_note_survives_first_chunk_outage() {
 /// Totals: SaveProgress 10, Append 9, TornAppend 9, TmpCreate 13, TmpWrite 13, TmpSync 13,
 /// Rename 13, DirSync 12 = 92. DirSync index 12 (the manifest renamed into place, then an error)
 /// resumes through the completed-chain load path and is in `fault_matrix_dirsync_manifest_commit_case`
-/// (ignored, issue #14), not in these 92.
+/// (issue #14, fixed), not in these 92.
 #[tokio::test]
 async fn fault_matrix_sweep_recovers_identically() {
     let env = Env::new().await;
@@ -1530,7 +1533,7 @@ async fn fault_matrix_sweep_recovers_identically() {
             fired += 1;
             let _ = std::fs::remove_dir_all(&b);
         }
-        // one past the last call of this kind never fires (a DirSync "call 12" is the ignored case)
+        // one past the last call of this kind never fires (DirSync "call 12" is the separate load-path case)
         if op != Op::DirSync {
             let b = tmp_root(&format!("mx_{op:?}_past"));
             seed_manifest(&b, CHUNK);
@@ -1552,10 +1555,9 @@ async fn fault_matrix_sweep_recovers_identically() {
 }
 
 /// DirSync at call index 12: the manifest is renamed into place (chain committed), then the call
-/// errors. Resume goes through the completed-chain load path, whose outputs differ from an
-/// uninterrupted run until egpivo/stablecoin-lab#14 (PR #15) is fixed.
+/// errors. Resume goes through the completed-chain load path, whose outputs must equal an
+/// uninterrupted run byte for byte (issue #14).
 #[tokio::test]
-#[ignore = "completed-chain load path diverges; fixed by PR #15 / issue #14"]
 async fn fault_matrix_dirsync_manifest_commit_case() {
     let env = Env::new().await;
     env.bad_mask(0b00_0010_0000);
@@ -1629,6 +1631,7 @@ async fn completed_chain_load_path_is_byte_identical() {
 #[tokio::test]
 async fn completed_chain_real_remove_failure_is_surfaced_and_harmless() {
     let env = Env::new().await;
+    let a = uninterrupted("rm_real_a").await;
     let b = tmp_root("rm_real");
     seed_manifest(&b, CHUNK);
     let dir = run_dir(&b);
@@ -1664,6 +1667,8 @@ async fn completed_chain_real_remove_failure_is_surfaced_and_harmless() {
         "stale checkpoint removed with the checkpoint dir"
     );
     assert!(dir.join("artifact_manifest.json").is_file());
+    // hard-error path end to end: retry loads the completed chain via the fixed path, byte-identical
+    assert_same_outputs(&run_dir(&a), &dir);
 }
 
 // ---------------------------------------------------------------------------------------------
