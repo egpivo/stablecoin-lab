@@ -171,6 +171,17 @@ pub(crate) mod fault {
         TornAppend,
         /// `write_atomic` writes the tmp file, then fails before the rename.
         Rename,
+        /// `write_atomic` fails before creating the tmp file.
+        TmpCreate,
+        /// `write_atomic` writes half the tmp file, then fails.
+        TmpWrite,
+        /// `write_atomic` fails at the tmp file fsync.
+        TmpSync,
+        /// `write_atomic` fails AFTER a successful rename (directory fsync error): the new file is
+        /// already in place although the caller sees an error.
+        DirSync,
+        /// `save_completed_chain` fails before stage k (1 csv, 2 bundle, 3 manifest, 4 cleanup).
+        Stage(u8),
     }
 
     struct Fault {
@@ -219,11 +230,24 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
+    #[cfg(test)]
+    if fault::hit(path, fault::Op::TmpCreate) {
+        anyhow::bail!("injected tmp create failure");
+    }
     {
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        #[cfg(test)]
+        if fault::hit(path, fault::Op::TmpWrite) {
+            let _ = f.write_all(&bytes[..bytes.len() / 2]);
+            anyhow::bail!("injected tmp write failure");
+        }
         f.write_all(bytes)
             .with_context(|| format!("write {}", tmp.display()))?;
+        #[cfg(test)]
+        if fault::hit(path, fault::Op::TmpSync) {
+            anyhow::bail!("injected tmp fsync failure");
+        }
         f.sync_all()
             .with_context(|| format!("fsync {}", tmp.display()))?;
     }
@@ -235,6 +259,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         );
     }
     std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    #[cfg(test)]
+    if fault::hit(path, fault::Op::DirSync) {
+        anyhow::bail!(
+            "injected directory fsync failure after rename of {}",
+            path.display()
+        );
+    }
     sync_parent_dir(path)
 }
 
@@ -783,11 +814,27 @@ pub fn save_completed_chain(
 ) -> Result<()> {
     let root = checkpoint_root(out_dir);
     std::fs::create_dir_all(&root)?;
+    #[cfg(test)]
+    if fault::hit(&root, fault::Op::Stage(4)) {
+        anyhow::bail!("injected failure at completed-chain stage 4 (cleanup)");
+    }
     clear_chain_fetch_progress(out_dir, chain)?;
+    #[cfg(test)]
+    if fault::hit(&root, fault::Op::Stage(1)) {
+        anyhow::bail!("injected failure at completed-chain stage 1 (transfers csv)");
+    }
     let csv_path = transfers_path(out_dir, chain);
     write_atomic(&csv_path, &events_to_csv_bytes(events, true)?)?;
+    #[cfg(test)]
+    if fault::hit(&root, fault::Op::Stage(2)) {
+        anyhow::bail!("injected failure at completed-chain stage 2 (chain bundle)");
+    }
     let json_path = chain_bundle_path(out_dir, chain);
     write_atomic(&json_path, serde_json::to_string_pretty(bundle)?.as_bytes())?;
+    #[cfg(test)]
+    if fault::hit(&root, fault::Op::Stage(3)) {
+        anyhow::bail!("injected failure at completed-chain stage 3 (manifest)");
+    }
     if !manifest.completed_chains.iter().any(|c| c == chain) {
         manifest.completed_chains.push(chain.to_string());
         manifest.completed_chains.sort();

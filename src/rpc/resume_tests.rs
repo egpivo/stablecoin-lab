@@ -120,6 +120,8 @@ pub(crate) struct MockState {
     /// When non-zero, an `eth_getLogs` starting exactly at this block returns ONLY one malformed
     /// log (undecodable Transfer): a chunk with zero events and one decode error.
     pub bad_only: AtomicU64,
+    /// Bit i set -> chunk i (counting from FROM, CHUNK blocks each) returns ONLY a malformed log.
+    pub bad_mask: AtomicU64,
     /// Every `(fromBlock, toBlock, succeeded)` requested via `eth_getLogs`, in order.
     pub log_requests: Mutex<Vec<(u64, u64, bool)>>,
 }
@@ -182,7 +184,9 @@ impl Respond for Responder {
                         "error":{"code":-32000,"message":"scripted outage"}
                     }));
                 }
-                if self.0.bad_only.load(Ordering::SeqCst) == f {
+                let mask = self.0.bad_mask.load(Ordering::SeqCst);
+                let in_mask = mask != 0 && f >= FROM && (mask >> ((f - FROM) / CHUNK)) & 1 == 1;
+                if self.0.bad_only.load(Ordering::SeqCst) == f || in_mask {
                     return ok(json!([{
                         "address": CONTRACT,
                         "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
@@ -211,6 +215,7 @@ pub(crate) async fn spawn_mock() -> (MockServer, Arc<MockState>) {
     let state = Arc::new(MockState {
         fail_from: AtomicU64::new(0),
         bad_only: AtomicU64::new(0),
+        bad_mask: AtomicU64::new(0),
         log_requests: Mutex::new(Vec::new()),
     });
     let server = MockServer::start().await;
@@ -339,6 +344,9 @@ impl Env {
             .collect();
         v.sort();
         v
+    }
+    fn bad_mask(&self, m: u64) {
+        self.state.bad_mask.store(m, Ordering::SeqCst);
     }
     fn bad_only(&self, b: u64) {
         self.state.bad_only.store(b, Ordering::SeqCst);
@@ -1244,4 +1252,248 @@ async fn failed_fallback_save_is_reported_loudly_and_stays_resumable() {
     env.fail_from(0);
     run_scan(&b, CHUNK).await.expect("resume");
     assert_same_outputs(&run_dir(&a), &run_dir(&b));
+}
+
+// ---------------------------------------------------------------------------------------------
+// round-2 review: rename-then-error recovery, completed-chain stage order, QA sample on resume
+// ---------------------------------------------------------------------------------------------
+
+/// DirSync fails AFTER the progress file was renamed into place: the on-disk progress is the NEW
+/// one while the caller sees an error. Recovery must work from either old or new progress.
+#[tokio::test]
+async fn progress_error_after_rename_recovers_from_new_progress() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let a = uninterrupted("ar_a").await;
+    // DirSync nth counts write_atomic calls: nth k (k<10) is the progress save of chunk k.
+    for nth in 0i64..10 {
+        let b = tmp_root(&format!("ar_b{nth}"));
+        seed_manifest(&b, CHUNK);
+        let dir = run_dir(&b);
+        fault::arm(&dir, Op::DirSync, nth);
+        assert!(run_scan(&b, CHUNK).await.is_err(), "nth={nth}");
+        fault::disarm(&dir);
+        // new progress is on disk, so the CSV must still hold that chunk's rows
+        let p = progress_json(&b);
+        assert_eq!(
+            p["last_fetched_through"],
+            FROM + (nth as u64 + 1) * CHUNK - 1,
+            "nth={nth}"
+        );
+        counters_ok(&b);
+        load_partial(&b)
+            .unwrap_or_else(|e| panic!("nth={nth}: new progress + CSV must be consistent: {e:#}"));
+        run_scan(&b, CHUNK)
+            .await
+            .unwrap_or_else(|e| panic!("nth={nth}: resume from NEW progress: {e:#}"));
+        assert_same_outputs(&run_dir(&a), &run_dir(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+}
+
+/// Failure before the rename leaves the OLD progress; the appended rows are orphans and are dropped.
+#[tokio::test]
+async fn progress_error_before_rename_recovers_from_old_progress() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let a = uninterrupted("br_a").await;
+    for op in [Op::TmpCreate, Op::TmpWrite, Op::TmpSync, Op::Rename] {
+        for nth in 0i64..10 {
+            let b = tmp_root(&format!("br_b{op:?}{nth}"));
+            seed_manifest(&b, CHUNK);
+            let dir = run_dir(&b);
+            fault::arm(&dir, op, nth);
+            assert!(run_scan(&b, CHUNK).await.is_err(), "{op:?} nth={nth}");
+            fault::disarm(&dir);
+            if nth > 0 {
+                let p = progress_json(&b);
+                assert_eq!(
+                    p["last_fetched_through"],
+                    FROM + nth as u64 * CHUNK - 1,
+                    "{op:?} nth={nth}: old progress"
+                );
+            }
+            run_scan(&b, CHUNK)
+                .await
+                .unwrap_or_else(|e| panic!("{op:?} nth={nth}: resume from OLD progress: {e:#}"));
+            assert_same_outputs(&run_dir(&a), &run_dir(&b));
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+}
+
+/// Message must not claim a specific commit outcome for a storage error.
+#[tokio::test]
+async fn storage_error_message_does_not_claim_old_state() {
+    let env = Env::new().await;
+    let b = tmp_root("msg");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    fault::arm(&dir, Op::DirSync, 2);
+    assert!(run_scan(&b, CHUNK).await.is_err());
+    fault::disarm(&dir);
+    let qa = read(&dir.join("qa_report.json"));
+    assert!(qa.contains("storage error"), "{qa}");
+    assert!(!qa.contains("left at last committed state"), "{qa}");
+    assert!(qa.contains("previous or the new"), "{qa}");
+    drop(env);
+}
+
+/// Completed-chain save: fail before every stage; resume must reproduce the uninterrupted outputs
+/// for failures up to (and excluding) the manifest commit.
+#[tokio::test]
+async fn completed_chain_failure_before_each_stage_then_resume() {
+    let env = Env::new().await;
+    let a = uninterrupted("st_a").await;
+    // stage numbering is logical: 1 csv, 2 bundle, 3 manifest, 4 cleanup (after the manifest commit)
+    for stage in [1u8, 2, 3] {
+        let b = tmp_root(&format!("st_b{stage}"));
+        seed_manifest(&b, CHUNK);
+        let dir = run_dir(&b);
+        fault::arm(&ckpt::checkpoint_root(&dir), Op::Stage(stage), 0);
+        assert!(run_scan(&b, CHUNK).await.is_err(), "stage {stage}");
+        fault::disarm(&ckpt::checkpoint_root(&dir));
+        // the fetch progress must still be there until the chain is committed in the manifest
+        assert!(
+            ckpt::fetch_progress_path(&dir, "ethereum").exists(),
+            "stage {stage}: fetch progress must survive until the completed-chain manifest commit"
+        );
+        env.clear_requests();
+        run_scan(&b, CHUNK)
+            .await
+            .unwrap_or_else(|e| panic!("stage {stage}: resume: {e:#}"));
+        assert_same_outputs(&run_dir(&a), &run_dir(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+}
+
+/// Cleanup failure AFTER the manifest commit: the chain is complete, resume must not refetch and
+/// must finish. (Byte-equality of ALL outputs on the completed-chain load path is a separate,
+/// pre-existing problem tracked in the follow-up issue; see `completed_chain_load_path_known_divergence`.)
+#[tokio::test]
+async fn completed_chain_cleanup_failure_after_manifest_commit() {
+    let env = Env::new().await;
+    let b = tmp_root("st_cleanup");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    let root = ckpt::checkpoint_root(&dir);
+    fault::arm(&root, Op::Stage(4), 0);
+    assert!(run_scan(&b, CHUNK).await.is_err());
+    fault::disarm(&root);
+    let m = ckpt::load_manifest(&dir).unwrap().unwrap();
+    assert_eq!(
+        m.completed_chains,
+        vec!["ethereum".to_string()],
+        "manifest commit happened first"
+    );
+    assert!(root.join("chain_ethereum.json").is_file());
+    env.clear_requests();
+    run_scan(&b, CHUNK)
+        .await
+        .expect("resume treats the chain as complete");
+    assert!(
+        env.state.log_requests.lock().unwrap().is_empty(),
+        "no refetch of a committed chain"
+    );
+    assert!(dir.join("artifact_manifest.json").is_file());
+    assert!(
+        !root.exists(),
+        "checkpoint dir cleared after a successful run"
+    );
+}
+
+/// Mid-write failures inside each completed-chain write (tmp / rename / dir fsync) then resume.
+#[tokio::test]
+async fn completed_chain_atomic_write_failures_then_resume() {
+    let env = Env::new().await;
+    let a = uninterrupted("cw_a").await;
+    // writes 0..9 are progress saves, 10 csv, 11 bundle, 12 manifest (final manifest update)
+    for op in [Op::TmpCreate, Op::TmpWrite, Op::TmpSync, Op::Rename] {
+        for nth in [10i64, 11, 12] {
+            let b = tmp_root(&format!("cw_b{op:?}{nth}"));
+            seed_manifest(&b, CHUNK);
+            let dir = run_dir(&b);
+            fault::arm(&dir, op, nth);
+            assert!(run_scan(&b, CHUNK).await.is_err(), "{op:?} nth={nth}");
+            fault::disarm(&dir);
+            run_scan(&b, CHUNK)
+                .await
+                .unwrap_or_else(|e| panic!("{op:?} nth={nth}: resume: {e:#}"));
+            assert_same_outputs(&run_dir(&a), &run_dir(&b));
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+    drop(env);
+}
+
+/// Medium-2: decode-QA sample note must survive a first-chunk RPC outage followed by resume.
+#[tokio::test]
+async fn qa_sample_note_survives_first_chunk_outage() {
+    let env = Env::new().await;
+    for (label, mask) in [
+        ("allbad", 1023u64),
+        ("mixed", 0b11_1010_1010),
+        ("lastbad", 1 << 9),
+    ] {
+        env.bad_mask(mask);
+        let a = uninterrupted(&format!("qs_{label}_a")).await;
+        for fail in [FROM, FROM + 100, FROM + 300, FROM + 900] {
+            let b = tmp_root(&format!("qs_{label}_b{fail}"));
+            seed_manifest(&b, CHUNK);
+            env.fail_from(fail);
+            assert!(run_scan(&b, CHUNK).await.is_err());
+            env.fail_from(0);
+            run_scan(&b, CHUNK)
+                .await
+                .unwrap_or_else(|e| panic!("{label}@{fail}: {e:#}"));
+            assert_same_outputs(&run_dir(&a), &run_dir(&b));
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+}
+
+/// Fault sweep: every fault kind at every call index, then resume; always identical or (for faults
+/// after the manifest commit) a completed run with no refetch.
+#[tokio::test]
+async fn fault_matrix_sweep_recovers_identically() {
+    let env = Env::new().await;
+    env.bad_mask(0b00_0010_0000);
+    let a = uninterrupted("mx_a").await;
+    let ops = [
+        Op::SaveProgress,
+        Op::Append,
+        Op::TornAppend,
+        Op::TmpCreate,
+        Op::TmpWrite,
+        Op::TmpSync,
+        Op::Rename,
+        Op::DirSync,
+    ];
+    let mut identical = 0;
+    for op in ops {
+        for nth in 0i64..13 {
+            let b = tmp_root(&format!("mx_{op:?}{nth}"));
+            seed_manifest(&b, CHUNK);
+            let dir = run_dir(&b);
+            fault::arm(&dir, op, nth);
+            let first = run_scan(&b, CHUNK).await;
+            fault::disarm(&dir);
+            if first.is_ok() {
+                continue; // fault index beyond the number of calls of this kind
+            }
+            run_scan(&b, CHUNK)
+                .await
+                .unwrap_or_else(|e| panic!("{op:?} nth={nth}: resume: {e:#}"));
+            if op == Op::DirSync && nth == 12 {
+                // manifest renamed into place (chain committed) before the error: this resumes via
+                // the completed-chain load path, whose output divergence is a separate known issue.
+                continue;
+            }
+            assert_same_outputs(&run_dir(&a), &run_dir(&b));
+            identical += 1;
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+    println!("fault matrix: {identical} faulted runs recovered byte-identically");
+    assert!(identical >= 50);
 }
