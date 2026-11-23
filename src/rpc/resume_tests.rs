@@ -1568,6 +1568,15 @@ async fn completed_chain_real_remove_failure_is_surfaced_and_harmless() {
         e.contains("remove") && e.contains("fetch_progress_ethereum.json"),
         "{e}"
     );
+    assert!(e.contains("manifest ALREADY COMMITTED"), "{e}");
+    assert!(
+        e.contains("cleanup of the in-flight fetch-progress files failed"),
+        "{e}"
+    );
+    assert!(
+        e.contains("recognizes the chain as complete (no refetch)"),
+        "{e}"
+    );
     // (a) the leftover is there and the chain is committed
     assert!(prog.exists(), "stale progress path left behind");
     let m = ckpt::load_manifest(&dir).unwrap().unwrap();
