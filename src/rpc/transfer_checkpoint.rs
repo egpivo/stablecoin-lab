@@ -2,6 +2,7 @@
 //! Chain-level: full chain done → `transfers_<chain>.csv` + `chain_<chain>.json`.
 //! Chunk-level (in-flight): each successful `eth_getLogs` chunk → `fetch_progress_<chain>.json` + append `fetch_partial_<chain>.csv`.
 
+use alloy::primitives::U256;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -74,10 +75,29 @@ pub struct FetchChunkProgress {
     pub chunks_done: u64,
     pub total_chunks: u64,
     pub logs_fetched: usize,
+    /// Decoded rows persisted in `fetch_partial_<chain>.csv` for blocks `..=last_fetched_through`.
+    /// Resume refuses a partial file whose row count differs (truncation / foreign rows).
+    pub events_persisted: u64,
+    /// Cumulative decode failures so far (restored on resume so the invariant gate stays honest).
+    pub decode_errors: u64,
+    /// Chunk whose `eth_getLogs` exhausted retries; it is NOT counted in `last_fetched_through`
+    /// and is re-fetched first on resume. `None` when the last stop was not an RPC failure.
+    #[serde(default)]
+    pub unresolved: Option<UnresolvedInterval>,
+}
+
+/// Inclusive block interval that could not be fetched; kept explicit in the checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedInterval {
+    pub from_block: u64,
+    pub to_block: u64,
+    pub error: String,
 }
 
 impl FetchChunkProgress {
-    pub const SCHEMA: &'static str = "transfer-audit-fetch-chunk-v1";
+    /// v2: adds `events_persisted`, `decode_errors`, `unresolved`; partial CSV rows are validated and
+    /// `value_u256` is restored from `value_raw` on load. v1 progress files are rejected (fail closed).
+    pub const SCHEMA: &'static str = "transfer-audit-fetch-chunk-v2";
 
     pub fn resume_from_block(&self) -> u64 {
         self.last_fetched_through.saturating_add(1)
@@ -112,6 +132,16 @@ pub fn fetch_partial_path(out_dir: &Path, chain: &str) -> PathBuf {
     checkpoint_root(out_dir).join(format!("fetch_partial_{chain}.csv"))
 }
 
+/// Write via temp file + rename so a crash never leaves a half-written JSON checkpoint.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
 pub fn clear_checkpoint_dir(out_dir: &Path) -> Result<()> {
     let root = checkpoint_root(out_dir);
     if root.exists() {
@@ -138,14 +168,35 @@ pub fn load_manifest(out_dir: &Path) -> Result<Option<CheckpointManifest>> {
         return Ok(None);
     }
     let raw = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
-    let m: CheckpointManifest =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    let m: CheckpointManifest = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "checkpoint manifest {} is truncated, corrupt or missing fields; use --fresh to restart",
+            path.display()
+        )
+    })?;
     if m.schema != CheckpointManifest::SCHEMA {
         anyhow::bail!(
             "unsupported checkpoint schema {:?} in {}; use --fresh to restart",
             m.schema,
             path.display()
         );
+    }
+    if chrono::DateTime::parse_from_rfc3339(&m.started_at).is_err() {
+        anyhow::bail!(
+            "checkpoint manifest {} has unparseable started_at {:?}; use --fresh",
+            path.display(),
+            m.started_at
+        );
+    }
+    let spec_chains: HashSet<&str> = m.chain_specs.iter().map(|c| c.chain.as_str()).collect();
+    for c in &m.completed_chains {
+        if !spec_chains.contains(c.as_str()) {
+            anyhow::bail!(
+                "checkpoint manifest {} lists completed chain {:?} that is not in its chain_specs; use --fresh",
+                path.display(),
+                c
+            );
+        }
     }
     Ok(Some(m))
 }
@@ -154,8 +205,7 @@ pub fn save_manifest(out_dir: &Path, manifest: &CheckpointManifest) -> Result<()
     let root = checkpoint_root(out_dir);
     std::fs::create_dir_all(&root)?;
     let path = manifest_path(out_dir);
-    std::fs::write(&path, serde_json::to_string_pretty(manifest)?)?;
-    Ok(())
+    write_atomic(&path, serde_json::to_string_pretty(manifest)?.as_bytes())
 }
 
 pub fn validate_manifest_matches(
@@ -227,9 +277,19 @@ pub fn load_fetch_progress(
     let p: FetchChunkProgress = serde_json::from_str(
         &std::fs::read_to_string(&path).with_context(|| path.display().to_string())?,
     )
-    .with_context(|| format!("parse {}", path.display()))?;
+    .with_context(|| {
+        format!(
+            "fetch checkpoint {} is truncated, corrupt, missing fields or has an old schema; use --fresh",
+            path.display()
+        )
+    })?;
     if p.schema != FetchChunkProgress::SCHEMA {
-        anyhow::bail!("unsupported fetch progress schema in {}", path.display());
+        anyhow::bail!(
+            "unsupported fetch progress schema {:?} in {} (expected {:?}); use --fresh",
+            p.schema,
+            path.display(),
+            FetchChunkProgress::SCHEMA
+        );
     }
     if p.chain != chain
         || p.from_block != from_block
@@ -243,27 +303,213 @@ pub fn load_fetch_progress(
             path.display()
         );
     }
+    validate_progress_consistency(&p, &path)?;
     Ok(Some(p))
+}
+
+/// Internal-consistency checks so a hand-edited or damaged progress file cannot skip block intervals.
+fn validate_progress_consistency(p: &FetchChunkProgress, path: &Path) -> Result<()> {
+    let bad = |why: String| -> Result<()> {
+        anyhow::bail!(
+            "inconsistent fetch checkpoint {}: {why}; use --fresh",
+            path.display()
+        )
+    };
+    if p.chunk_size == 0 || p.from_block == 0 || p.to_block < p.from_block {
+        return bad("invalid window".into());
+    }
+    // `from_block - 1` means "no chunk finished yet" (written when the first chunk is unresolved).
+    if p.last_fetched_through < p.from_block - 1 || p.last_fetched_through > p.to_block {
+        return bad(format!(
+            "last_fetched_through {} outside [{}, {}]",
+            p.last_fetched_through,
+            p.from_block - 1,
+            p.to_block
+        ));
+    }
+    let done_span = p.last_fetched_through + 1 - p.from_block;
+    if p.last_fetched_through != p.to_block && done_span.checked_rem(p.chunk_size) != Some(0) {
+        return bad(format!(
+            "last_fetched_through {} is not on a chunk boundary",
+            p.last_fetched_through
+        ));
+    }
+    let want_done = count_chunks(p.from_block, p.last_fetched_through, p.chunk_size);
+    let want_total = count_chunks(p.from_block, p.to_block, p.chunk_size);
+    if p.chunks_done != want_done || p.total_chunks != want_total {
+        return bad(format!(
+            "chunks_done/total_chunks {}/{} != expected {}/{}",
+            p.chunks_done, p.total_chunks, want_done, want_total
+        ));
+    }
+    if let Some(u) = &p.unresolved {
+        if p.is_complete() {
+            return bad("window marked complete but has an unresolved interval".into());
+        }
+        if u.from_block != p.resume_from_block()
+            || u.to_block < u.from_block
+            || u.to_block > p.to_block
+        {
+            return bad(format!(
+                "unresolved interval {}..{} does not start at resume block {}",
+                u.from_block,
+                u.to_block,
+                p.resume_from_block()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn save_fetch_progress(out_dir: &Path, progress: &FetchChunkProgress) -> Result<()> {
     std::fs::create_dir_all(checkpoint_root(out_dir))?;
     let path = fetch_progress_path(out_dir, &progress.chain);
-    std::fs::write(&path, serde_json::to_string_pretty(progress)?)?;
-    Ok(())
+    write_atomic(&path, serde_json::to_string_pretty(progress)?.as_bytes())
 }
 
-pub fn load_fetch_partial_events(out_dir: &Path, chain: &str) -> Result<Vec<TransferEvent>> {
-    let path = fetch_partial_path(out_dir, chain);
-    if !path.exists() {
-        return Ok(Vec::new());
+const ZERO_ADDR: &str = "0x0000000000000000000000000000000000000000";
+
+/// `value_u256` is `#[serde(skip)]`, so a CSV round trip yields 0. Rebuild it from the persisted
+/// `value_raw` (decimal) and check the row is internally consistent. Fails closed on garbage.
+fn restore_event(mut ev: TransferEvent, row: usize, path: &Path) -> Result<TransferEvent> {
+    let ctx = |why: &str| {
+        anyhow::anyhow!(
+            "{}: row {row}: {why} (tx {} log_index {}); checkpoint is corrupt, use --fresh",
+            path.display(),
+            ev.tx_hash,
+            ev.log_index
+        )
+    };
+    if ev.value_raw.is_empty() || !ev.value_raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ctx(&format!(
+            "value_raw {:?} is not a decimal integer",
+            ev.value_raw
+        )));
     }
+    let value = U256::from_str_radix(&ev.value_raw, 10).map_err(|_| {
+        ctx(&format!(
+            "value_raw {:?} does not fit in uint256",
+            ev.value_raw
+        ))
+    })?;
+    let kind = if ev.from == ZERO_ADDR {
+        "mint"
+    } else if ev.to == ZERO_ADDR {
+        "burn"
+    } else {
+        "transfer"
+    };
+    if ev.kind != kind {
+        return Err(ctx(&format!(
+            "kind {:?} contradicts from/to (expected {kind:?})",
+            ev.kind
+        )));
+    }
+    ev.value_u256 = value;
+    Ok(ev)
+}
+
+fn read_events_csv(path: &Path) -> Result<Vec<TransferEvent>> {
     let mut events = Vec::new();
-    let mut rdr = csv::Reader::from_path(&path)?;
-    for row in rdr.deserialize::<TransferEvent>() {
-        events.push(row?);
+    let mut rdr = csv::Reader::from_path(path).with_context(|| path.display().to_string())?;
+    for (i, row) in rdr.deserialize::<TransferEvent>().enumerate() {
+        let ev = row.with_context(|| {
+            format!(
+                "{}: row {} is truncated or malformed; use --fresh",
+                path.display(),
+                i + 1
+            )
+        })?;
+        events.push(restore_event(ev, i + 1, path)?);
     }
     Ok(events)
+}
+
+/// Load and validate the in-flight partial events for `progress`.
+///
+/// * restores `value_u256` from `value_raw`;
+/// * rows from a chunk that was appended but whose progress was never saved (crash between the two
+///   writes; blocks beyond `last_fetched_through`) are dropped and the file rewritten, because that
+///   chunk is fetched again;
+/// * rows must belong to this chain/contract/window and match `events_persisted`.
+pub fn load_fetch_partial_events(
+    out_dir: &Path,
+    progress: &FetchChunkProgress,
+) -> Result<Vec<TransferEvent>> {
+    let path = fetch_partial_path(out_dir, &progress.chain);
+    if !path.exists() {
+        if progress.events_persisted == 0 {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!(
+            "{} is missing but fetch progress records {} persisted events; use --fresh",
+            path.display(),
+            progress.events_persisted
+        );
+    }
+    let all = read_events_csv(&path)?;
+    let total = all.len();
+    let mut kept = Vec::with_capacity(total);
+    for (i, ev) in all.into_iter().enumerate() {
+        if ev.chain != progress.chain
+            || addr_norm(&ev.contract_address) != addr_norm(&progress.contract_address)
+        {
+            anyhow::bail!(
+                "{}: row {} belongs to {}/{}, expected {}/{}; use --fresh",
+                path.display(),
+                i + 1,
+                ev.chain,
+                ev.contract_address,
+                progress.chain,
+                progress.contract_address
+            );
+        }
+        if ev.block_number < progress.from_block || ev.block_number > progress.to_block {
+            anyhow::bail!(
+                "{}: row {} block {} outside window {}..{}; use --fresh",
+                path.display(),
+                i + 1,
+                ev.block_number,
+                progress.from_block,
+                progress.to_block
+            );
+        }
+        if ev.block_number > progress.last_fetched_through {
+            continue; // orphan of an un-checkpointed chunk; will be re-fetched
+        }
+        kept.push(ev);
+    }
+    if kept.len() as u64 != progress.events_persisted {
+        anyhow::bail!(
+            "{}: {} usable rows but fetch progress records {}; file truncated or modified; use --fresh",
+            path.display(),
+            kept.len(),
+            progress.events_persisted
+        );
+    }
+    if kept.len() != total {
+        rewrite_partial(&path, &kept)?;
+    }
+    Ok(kept)
+}
+
+fn rewrite_partial(path: &Path, events: &[TransferEvent]) -> Result<()> {
+    if events.is_empty() {
+        std::fs::remove_file(path)?; // append recreates it with a header
+        return Ok(());
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut wtr = csv::Writer::from_path(&tmp)?;
+        for ev in events {
+            wtr.serialize(ev)?;
+        }
+        wtr.flush()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub fn append_fetch_partial_events(
@@ -276,7 +522,7 @@ pub fn append_fetch_partial_events(
     }
     std::fs::create_dir_all(checkpoint_root(out_dir))?;
     let path = fetch_partial_path(out_dir, chain);
-    let file_exists = path.exists();
+    let file_exists = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let mut wtr = csv::WriterBuilder::new()
         .has_headers(!file_exists)
@@ -300,15 +546,42 @@ pub fn load_completed_chain(
             chain
         );
     }
-    let mut events = Vec::new();
-    let mut rdr = csv::Reader::from_path(&csv_path)?;
-    for row in rdr.deserialize::<TransferEvent>() {
-        events.push(row?);
-    }
+    let events = read_events_csv(&csv_path)?;
     let bundle: CheckpointChainBundle = serde_json::from_str(
         &std::fs::read_to_string(&json_path).with_context(|| json_path.display().to_string())?,
     )
-    .with_context(|| format!("parse {}", json_path.display()))?;
+    .with_context(|| {
+        format!(
+            "chain bundle {} is truncated, corrupt or missing fields; use --fresh",
+            json_path.display()
+        )
+    })?;
+    // Cross-check CSV against the bundle that summarised it.
+    if events.len() != bundle.supply.transfer_event_count {
+        anyhow::bail!(
+            "{}: {} rows but chain bundle records {} transfers; use --fresh",
+            csv_path.display(),
+            events.len(),
+            bundle.supply.transfer_event_count
+        );
+    }
+    let sum = |kind: &str| {
+        events
+            .iter()
+            .filter(|e| e.kind == kind)
+            .fold(U256::ZERO, |a, e| a + e.value_u256)
+            .to_string()
+    };
+    if sum("mint") != bundle.supply.sum_mints_raw || sum("burn") != bundle.supply.sum_burns_raw {
+        anyhow::bail!(
+            "{}: mint/burn sums recomputed from rows ({}/{}) differ from chain bundle ({}/{}); use --fresh",
+            csv_path.display(),
+            sum("mint"),
+            sum("burn"),
+            bundle.supply.sum_mints_raw,
+            bundle.supply.sum_burns_raw
+        );
+    }
     Ok((events, bundle))
 }
 
@@ -329,7 +602,7 @@ pub fn save_completed_chain(
     }
     wtr.flush()?;
     let json_path = chain_bundle_path(out_dir, chain);
-    std::fs::write(&json_path, serde_json::to_string_pretty(bundle)?)?;
+    write_atomic(&json_path, serde_json::to_string_pretty(bundle)?.as_bytes())?;
     if !manifest.completed_chains.iter().any(|c| c == chain) {
         manifest.completed_chains.push(chain.to_string());
         manifest.completed_chains.sort();
@@ -458,6 +731,9 @@ mod tests {
             chunks_done: 1,
             total_chunks: 2,
             logs_fetched: 10,
+            events_persisted: 10,
+            decode_errors: 0,
+            unresolved: None,
         };
         assert_eq!(p.resume_from_block(), 500);
         assert!(!p.is_complete());
@@ -514,6 +790,9 @@ mod tests {
             chunks_done: 1,
             total_chunks: 2,
             logs_fetched: 3,
+            events_persisted: 3,
+            decode_errors: 0,
+            unresolved: None,
         };
         save_fetch_progress(&out, &progress).unwrap();
         let loaded = load_fetch_progress(&out, "ethereum", "0xabcdef", 1, 10, 5)
@@ -524,12 +803,33 @@ mod tests {
     }
 
     #[test]
-    fn partial_events_append_and_load() {
+    fn partial_events_append_and_load_restores_value_u256() {
         let out = tmp_out("partial");
-        append_fetch_partial_events(&out, "base", &[sample_event("base")]).unwrap();
-        append_fetch_partial_events(&out, "base", &[sample_event("base")]).unwrap();
-        let rows = load_fetch_partial_events(&out, "base").unwrap();
+        let mut ev = sample_event("base");
+        ev.value_raw = "1180591620717411303424".into(); // 2^70 > u64::MAX
+        ev.value_u256 = U256::from(1u128 << 70);
+        let mut ev2 = ev.clone();
+        ev2.log_index = 1;
+        append_fetch_partial_events(&out, "base", &[ev.clone()]).unwrap();
+        append_fetch_partial_events(&out, "base", &[ev2]).unwrap();
+        let progress = FetchChunkProgress {
+            schema: FetchChunkProgress::SCHEMA.into(),
+            chain: "base".into(),
+            contract_address: "0xabc".into(),
+            from_block: 1,
+            to_block: 20,
+            chunk_size: 10,
+            last_fetched_through: 10,
+            chunks_done: 1,
+            total_chunks: 2,
+            logs_fetched: 2,
+            events_persisted: 2,
+            decode_errors: 0,
+            unresolved: None,
+        };
+        let rows = load_fetch_partial_events(&out, &progress).unwrap();
         assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].value_u256, U256::from(1u128 << 70));
         let _ = std::fs::remove_dir_all(&out);
     }
 

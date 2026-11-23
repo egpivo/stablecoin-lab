@@ -1172,6 +1172,7 @@ pub(crate) async fn process_chain(
     ) {
         Ok(p) => p,
         Err(e) => {
+            eprintln!("[{}] fetch checkpoint: {e:#}", chain.to_uppercase());
             errors.push(format!("fetch checkpoint: {e:#}"));
             hard_error = true;
             let supply = partial_supply_after_fetch_fail(
@@ -1204,16 +1205,22 @@ pub(crate) async fn process_chain(
     let fetch_already_done = fetch_progress.as_ref().is_some_and(|p| p.is_complete());
 
     let mut events = if fetch_already_done {
-        match transfer_checkpoint::load_fetch_partial_events(out_dir, chain) {
+        match transfer_checkpoint::load_fetch_partial_events(
+            out_dir,
+            fetch_progress
+                .as_ref()
+                .expect("fetch_already_done implies progress"),
+        ) {
             Ok(e) => e,
             Err(e) => {
+                eprintln!("[{}] load partial transfers: {e:#}", chain.to_uppercase());
                 errors.push(format!("load partial transfers: {e:#}"));
                 hard_error = true;
                 Vec::new()
             }
         }
     } else if let Some(ref p) = fetch_progress {
-        match transfer_checkpoint::load_fetch_partial_events(out_dir, chain) {
+        match transfer_checkpoint::load_fetch_partial_events(out_dir, p) {
             Ok(e) => {
                 println!(
                     "[{}] resuming log fetch from block {} (chunk {}/{})",
@@ -1238,6 +1245,7 @@ pub(crate) async fn process_chain(
                 e
             }
             Err(e) => {
+                eprintln!("[{}] load partial transfers: {e:#}", chain.to_uppercase());
                 errors.push(format!("load partial transfers: {e:#}"));
                 hard_error = true;
                 Vec::new()
@@ -1294,7 +1302,17 @@ pub(crate) async fn process_chain(
         .unwrap_or(from_block);
 
     let mut logs_fetched: usize = fetch_progress.as_ref().map(|p| p.logs_fetched).unwrap_or(0);
-    let mut decode_errors = 0usize;
+    let mut decode_errors: usize = fetch_progress
+        .as_ref()
+        .map(|p| p.decode_errors as usize)
+        .unwrap_or(0);
+    // Inclusive end of the last chunk known to be fetched; `from_block - 1` = nothing yet.
+    let last_through = std::cell::Cell::new(
+        fetch_progress
+            .as_ref()
+            .map(|p| p.last_fetched_through)
+            .unwrap_or(from_block - 1),
+    );
     let mut qa_sample_done = fetch_already_done || fetch_progress.is_some();
 
     if !fetch_already_done && !hard_error {
@@ -1376,8 +1394,12 @@ pub(crate) async fn process_chain(
                     chunks_done,
                     total_chunks,
                     logs_fetched,
+                    events_persisted: events.len() as u64,
+                    decode_errors: decode_errors as u64,
+                    unresolved: None,
                 };
                 transfer_checkpoint::save_fetch_progress(&out_owned, &progress)?;
+                last_through.set(end);
                 Ok(())
             },
         )
@@ -1386,7 +1408,38 @@ pub(crate) async fn process_chain(
         if let Err(e) = fetch_result {
             let msg = format!("eth_getLogs failed: {e:#}");
             eprintln!("[{}] {msg}", chain.to_uppercase());
-            errors.push(msg);
+            errors.push(msg.clone());
+            // Keep the failed interval explicit in the checkpoint; it is re-fetched first on resume.
+            let next = last_through.get() + 1;
+            let progress = FetchChunkProgress {
+                schema: FetchChunkProgress::SCHEMA.to_string(),
+                chain: chain.to_string(),
+                contract_address: contract_str.clone(),
+                from_block,
+                to_block: end_blk,
+                chunk_size,
+                last_fetched_through: last_through.get(),
+                chunks_done: transfer_checkpoint::count_chunks(
+                    from_block,
+                    last_through.get(),
+                    chunk_size,
+                ),
+                total_chunks,
+                logs_fetched,
+                events_persisted: events.len() as u64,
+                decode_errors: decode_errors as u64,
+                unresolved: Some(transfer_checkpoint::UnresolvedInterval {
+                    from_block: next,
+                    to_block: next.saturating_add(chunk_size - 1).min(end_blk),
+                    error: msg,
+                }),
+            };
+            if let Err(e) = transfer_checkpoint::save_fetch_progress(out_dir, &progress) {
+                eprintln!(
+                    "[{}] could not record unresolved interval: {e:#}",
+                    chain.to_uppercase()
+                );
+            }
             let supply = partial_supply_after_fetch_fail(
                 chain,
                 &config,
