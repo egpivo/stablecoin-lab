@@ -831,7 +831,13 @@ pub fn save_completed_chain(
     if fault::hit(&root, fault::Op::Stage(4)) {
         anyhow::bail!("injected failure at completed-chain stage 4 (cleanup)");
     }
-    clear_chain_fetch_progress(out_dir, chain)?;
+    clear_chain_fetch_progress(out_dir, chain).with_context(|| {
+        format!(
+            "chain {chain:?}: completed-chain manifest ALREADY COMMITTED, but cleanup of the in-flight \
+fetch-progress files failed; retrying the same run recognizes the chain as complete (no refetch) and \
+clears the stale checkpoint files"
+        )
+    })?;
     println!(
         "[{}] chain checkpoint saved ({} transfer rows) — safe to stop; re-run same --run-id to resume",
         chain.to_uppercase(),
