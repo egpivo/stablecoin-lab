@@ -117,6 +117,9 @@ fn abi_string(s: &str) -> String {
 pub(crate) struct MockState {
     /// `eth_getLogs` with `fromBlock >= fail_from` returns a JSON-RPC error (0 = never fail).
     pub fail_from: AtomicU64,
+    /// When non-zero, an `eth_getLogs` starting exactly at this block returns ONLY one malformed
+    /// log (undecodable Transfer): a chunk with zero events and one decode error.
+    pub bad_only: AtomicU64,
     /// Every `(fromBlock, toBlock, succeeded)` requested via `eth_getLogs`, in order.
     pub log_requests: Mutex<Vec<(u64, u64, bool)>>,
 }
@@ -179,6 +182,19 @@ impl Respond for Responder {
                         "error":{"code":-32000,"message":"scripted outage"}
                     }));
                 }
+                if self.0.bad_only.load(Ordering::SeqCst) == f {
+                    return ok(json!([{
+                        "address": CONTRACT,
+                        "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
+                        "data": "0x",
+                        "blockNumber": format!("0x{f:x}"),
+                        "blockHash": format!("0x{f:064x}"),
+                        "transactionHash": format!("0x{:064x}", 0xbad0_0000u64 + f),
+                        "transactionIndex": "0x0",
+                        "logIndex": "0x0",
+                        "removed": false,
+                    }]));
+                }
                 let logs: Vec<Value> = fixture_logs()
                     .iter()
                     .filter(|l| l.block >= f && l.block <= t)
@@ -194,6 +210,7 @@ impl Respond for Responder {
 pub(crate) async fn spawn_mock() -> (MockServer, Arc<MockState>) {
     let state = Arc::new(MockState {
         fail_from: AtomicU64::new(0),
+        bad_only: AtomicU64::new(0),
         log_requests: Mutex::new(Vec::new()),
     });
     let server = MockServer::start().await;
@@ -322,6 +339,9 @@ impl Env {
             .collect();
         v.sort();
         v
+    }
+    fn bad_only(&self, b: u64) {
+        self.state.bad_only.store(b, Ordering::SeqCst);
     }
     fn clear_requests(&self) {
         self.state.log_requests.lock().unwrap().clear();
@@ -967,4 +987,239 @@ async fn manifests_and_sha256_are_reproducible() {
     }
     assert_same_outputs(&run_dir(&a), &run_dir(&b));
     assert_same_outputs(&run_dir(&a), &run_dir(&c));
+}
+
+// ---------------------------------------------------------------------------------------------
+// storage-fault tests (review follow-up): progress write / CSV append / rename failures
+// ---------------------------------------------------------------------------------------------
+
+use ckpt::fault::{self, Op};
+
+const BAD_CHUNK: u64 = FROM + 500;
+
+fn counters_ok(root: &Path) {
+    let p = progress_json(root);
+    let n = |k: &str| p[k].as_u64().unwrap();
+    assert_eq!(
+        n("events_persisted") + n("decode_errors"),
+        n("logs_fetched"),
+        "progress counters must describe one committed state: {p}"
+    );
+}
+
+fn audit_row(root: &Path) -> String {
+    read(&run_dir(root).join("supply_audit.csv"))
+        .lines()
+        .nth(1)
+        .unwrap()
+        .to_string()
+}
+
+/// (1) returned progress-write error -> fallback save -> resume (incl. zero-event decode-only chunk)
+#[tokio::test]
+async fn progress_write_failure_then_resume_matches_uninterrupted() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let a = uninterrupted("pw_a").await;
+    assert!(
+        audit_row(&a).ends_with(",1"),
+        "fixture: one decode error: {}",
+        audit_row(&a)
+    );
+    for nth in [0i64, 3, 5, 9] {
+        let b = tmp_root(&format!("pw_b{nth}"));
+        seed_manifest(&b, CHUNK);
+        fault::arm(&run_dir(&b), Op::SaveProgress, nth);
+        let first = run_scan(&b, CHUNK).await;
+        fault::disarm(&run_dir(&b));
+        assert!(
+            first.is_err(),
+            "nth={nth}: injected save failure must fail the run"
+        );
+        if ckpt::fetch_progress_path(&run_dir(&b), "ethereum").exists() {
+            counters_ok(&b);
+        }
+        run_scan(&b, CHUNK)
+            .await
+            .unwrap_or_else(|e| panic!("nth={nth}: resume must succeed: {e:#}"));
+        assert_same_outputs(&run_dir(&a), &run_dir(&b));
+        assert_eq!(audit_row(&a), audit_row(&b), "nth={nth}");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+    let _ = std::fs::remove_dir_all(&a);
+}
+
+/// (2) CSV append failure and torn tail, then resume
+#[tokio::test]
+async fn partial_csv_append_failure_or_torn_tail_then_resume() {
+    let env = Env::new().await;
+    let a = uninterrupted("ap_a").await;
+    for (i, op) in [Op::Append, Op::TornAppend].into_iter().enumerate() {
+        let b = tmp_root(&format!("ap_b{i}"));
+        seed_manifest(&b, CHUNK);
+        fault::arm(&run_dir(&b), op, 4);
+        let first = run_scan(&b, CHUNK).await;
+        fault::disarm(&run_dir(&b));
+        assert!(first.is_err(), "{op:?}");
+        run_scan(&b, CHUNK)
+            .await
+            .unwrap_or_else(|e| panic!("{op:?}: resume must recover: {e:#}"));
+        assert_same_outputs(&run_dir(&a), &run_dir(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+    drop(env);
+}
+
+/// (3) failure between tmp write and rename
+#[tokio::test]
+async fn failure_between_tmp_write_and_rename_then_resume() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let a = uninterrupted("rn_a").await;
+    for nth in [1i64, 3, 5] {
+        let b = tmp_root(&format!("rn_b{nth}"));
+        seed_manifest(&b, CHUNK);
+        fault::arm(&run_dir(&b), Op::Rename, nth);
+        let first = run_scan(&b, CHUNK).await;
+        fault::disarm(&run_dir(&b));
+        assert!(first.is_err(), "nth={nth}");
+        run_scan(&b, CHUNK)
+            .await
+            .unwrap_or_else(|e| panic!("nth={nth}: resume: {e:#}"));
+        assert_same_outputs(&run_dir(&a), &run_dir(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+    drop(env);
+}
+
+/// (4) repeated resume after repeated storage errors
+#[tokio::test]
+async fn repeated_resume_after_repeated_storage_errors() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let a = uninterrupted("rs_a").await;
+    let b = tmp_root("rs_b");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    let plan = [
+        (Op::SaveProgress, 2i64),
+        (Op::SaveProgress, 2),
+        (Op::TornAppend, 1),
+        (Op::SaveProgress, 0),
+        (Op::Rename, 1),
+        (Op::SaveProgress, 1),
+    ];
+    for (op, nth) in plan {
+        fault::arm(&dir, op, nth);
+        let r = run_scan(&b, CHUNK).await;
+        fault::disarm(&dir);
+        assert!(r.is_err(), "{op:?}/{nth} should fail the run");
+        if ckpt::fetch_progress_path(&dir, "ethereum").exists() {
+            counters_ok(&b);
+        }
+    }
+    run_scan(&b, CHUNK).await.expect("final clean resume");
+    assert_same_outputs(&run_dir(&a), &run_dir(&b));
+    assert_eq!(audit_row(&a), audit_row(&b));
+    let _ = (a, b);
+}
+
+/// (5) a storage error is reported as storage, never as an unresolved RPC interval
+#[tokio::test]
+async fn storage_error_is_not_classified_as_rpc_failure() {
+    let env = Env::new().await;
+    let b = tmp_root("cls");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    fault::arm(&dir, Op::SaveProgress, 3);
+    let first = run_scan(&b, CHUNK).await;
+    fault::disarm(&dir);
+    assert!(first.is_err());
+    let qa = read(&dir.join("qa_report.json"));
+    assert!(
+        qa.contains("storage error"),
+        "must be labelled a storage error:\n{qa}"
+    );
+    assert!(
+        !qa.contains("eth_getLogs failed"),
+        "storage failure mislabelled as RPC:\n{qa}"
+    );
+    let p = progress_json(&b);
+    assert!(
+        p["unresolved"].is_null(),
+        "storage failure must not create an unresolved RPC interval: {p}"
+    );
+    counters_ok(&b);
+    // no RPC retries were burned on it
+    assert!(env.state.log_requests.lock().unwrap().iter().all(|r| r.2));
+    let _ = b;
+}
+
+/// (6) value_raw beyond u128, and 2^256 overflow
+#[tokio::test]
+async fn value_raw_u256_boundaries() {
+    let root = tmp_root("u256");
+    let dir = run_dir(&root);
+    let mk = |idx: u64, raw: &str| crate::decode::TransferEvent {
+        chain: "ethereum".into(),
+        contract_address: PROGRESS_ARGS.1.into(),
+        block_number: FROM + 1,
+        tx_hash: format!("0x{idx:064x}"),
+        log_index: idx,
+        from: ZERO.into(),
+        to: A.into(),
+        value_raw: raw.into(),
+        value_decimal: "0".into(),
+        kind: "mint".into(),
+        value_u256: U256::ZERO,
+    };
+    let progress = |n: u64| ckpt::FetchChunkProgress {
+        schema: ckpt::FetchChunkProgress::SCHEMA.into(),
+        chain: "ethereum".into(),
+        contract_address: PROGRESS_ARGS.1.into(),
+        from_block: FROM,
+        to_block: TO,
+        chunk_size: CHUNK,
+        last_fetched_through: FROM + 99,
+        chunks_done: 1,
+        total_chunks: 10,
+        logs_fetched: n as usize,
+        events_persisted: n,
+        decode_errors: 0,
+        unresolved: None,
+    };
+    let two128 = "340282366920938463463374607431768211456";
+    let max = U256::MAX.to_string();
+    ckpt::append_fetch_partial_events(&dir, "ethereum", &[mk(0, two128), mk(1, &max)]).unwrap();
+    let rows = ckpt::load_fetch_partial_events(&dir, &progress(2)).unwrap();
+    assert_eq!(
+        rows[0].value_u256,
+        U256::from(1u128 << 127) * U256::from(2u8)
+    );
+    assert_eq!(rows[1].value_u256, U256::MAX);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let overflow = "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+    ckpt::append_fetch_partial_events(&dir, "ethereum", &[mk(0, overflow)]).unwrap();
+    let e = err_text(ckpt::load_fetch_partial_events(&dir, &progress(1)));
+    assert!(
+        e.contains("does not fit in uint256") && e.contains("--fresh"),
+        "{e}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// (7) decode_errors > logs_fetched (and other counter contradictions) are rejected
+#[tokio::test]
+async fn counter_contradictions_are_rejected() {
+    let (_env, root) = checkpointed("counters").await;
+    edit_progress(&root, |v| v["decode_errors"] = json!(99));
+    let e = err_text(load_progress(&root));
+    assert!(e.contains("decode_errors"), "{e}");
+    edit_progress(&root, |v| {
+        v["decode_errors"] = json!(0);
+        v["events_persisted"] = json!(v["logs_fetched"].as_u64().unwrap() + 1);
+    });
+    let e = err_text(load_progress(&root));
+    assert!(e.contains("events_persisted"), "{e}");
 }

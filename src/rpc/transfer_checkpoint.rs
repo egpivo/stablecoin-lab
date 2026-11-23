@@ -132,12 +132,77 @@ pub fn fetch_partial_path(out_dir: &Path, chain: &str) -> PathBuf {
     checkpoint_root(out_dir).join(format!("fetch_partial_{chain}.csv"))
 }
 
+/// Test-only fault injection, scoped by path prefix so parallel tests cannot interfere.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Op {
+        /// `save_fetch_progress` returns Err before writing anything.
+        SaveProgress,
+        /// `append_fetch_partial_events` returns Err before writing anything.
+        Append,
+        /// `append_fetch_partial_events` writes half the bytes, then returns Err (torn tail).
+        TornAppend,
+        /// `write_atomic` writes the tmp file, then fails before the rename.
+        Rename,
+    }
+
+    struct Fault {
+        prefix: PathBuf,
+        op: Op,
+        nth: i64,
+    }
+
+    static FAULTS: Mutex<Vec<Fault>> = Mutex::new(Vec::new());
+
+    /// Fail the `nth` (0-based) matching call under `prefix`, once.
+    pub fn arm(prefix: &Path, op: Op, nth: i64) {
+        FAULTS.lock().unwrap().push(Fault {
+            prefix: prefix.to_path_buf(),
+            op,
+            nth,
+        });
+    }
+
+    pub fn disarm(prefix: &Path) {
+        FAULTS.lock().unwrap().retain(|f| f.prefix != prefix);
+    }
+
+    pub fn hit(path: &Path, op: Op) -> bool {
+        let mut v = FAULTS.lock().unwrap();
+        let mut fire = false;
+        let mut i = 0;
+        while i < v.len() {
+            if v[i].op == op && path.starts_with(&v[i].prefix) {
+                if v[i].nth == 0 {
+                    v.remove(i);
+                    fire = true;
+                    continue;
+                }
+                v[i].nth -= 1;
+            }
+            i += 1;
+        }
+        fire
+    }
+}
+
 /// Write via temp file + rename so a crash never leaves a half-written JSON checkpoint.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    #[cfg(test)]
+    if fault::hit(path, fault::Op::Rename) {
+        anyhow::bail!(
+            "injected failure between tmp write and rename of {}",
+            path.display()
+        );
+    }
     std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
     Ok(())
 }
@@ -362,6 +427,13 @@ fn validate_progress_consistency(p: &FetchChunkProgress, path: &Path) -> Result<
 }
 
 pub fn save_fetch_progress(out_dir: &Path, progress: &FetchChunkProgress) -> Result<()> {
+    #[cfg(test)]
+    if fault::hit(
+        &fetch_progress_path(out_dir, &progress.chain),
+        fault::Op::SaveProgress,
+    ) {
+        anyhow::bail!("injected progress write failure");
+    }
     std::fs::create_dir_all(checkpoint_root(out_dir))?;
     let path = fetch_progress_path(out_dir, &progress.chain);
     write_atomic(&path, serde_json::to_string_pretty(progress)?.as_bytes())
@@ -523,7 +595,13 @@ pub fn append_fetch_partial_events(
     std::fs::create_dir_all(checkpoint_root(out_dir))?;
     let path = fetch_partial_path(out_dir, chain);
     let file_exists = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    #[cfg(test)]
+    if fault::hit(&path, fault::Op::Append) {
+        anyhow::bail!("injected partial CSV append failure");
+    }
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    #[cfg(test)]
+    let torn = fault::hit(&path, fault::Op::TornAppend);
     let mut wtr = csv::WriterBuilder::new()
         .has_headers(!file_exists)
         .from_writer(&mut file);
@@ -531,6 +609,14 @@ pub fn append_fetch_partial_events(
         wtr.serialize(ev)?;
     }
     wtr.flush()?;
+    #[cfg(test)]
+    if torn {
+        drop(wtr);
+        let len = file.metadata()?.len();
+        let keep = len.saturating_sub(40);
+        file.set_len(keep)?; // cut inside the last appended row
+        anyhow::bail!("injected torn partial CSV append");
+    }
     Ok(())
 }
 
