@@ -1172,6 +1172,7 @@ pub(crate) async fn process_chain(
     ) {
         Ok(p) => p,
         Err(e) => {
+            eprintln!("[{}] fetch checkpoint: {e:#}", chain.to_uppercase());
             errors.push(format!("fetch checkpoint: {e:#}"));
             hard_error = true;
             let supply = partial_supply_after_fetch_fail(
@@ -1198,22 +1199,54 @@ pub(crate) async fn process_chain(
 
     if fetch_progress.is_none() && transfer_checkpoint::fetch_partial_path(out_dir, chain).exists()
     {
-        transfer_checkpoint::clear_chain_fetch_progress(out_dir, chain).ok();
+        // Stale partial rows without a valid progress file: clear them or stop. Never fetch on top.
+        if let Err(e) = transfer_checkpoint::clear_chain_fetch_progress(out_dir, chain) {
+            let msg = format!(
+                "cannot clear stale partial fetch data (no valid progress for this chain); refusing to start a new fetch on top of it: {e:#}"
+            );
+            eprintln!("[{}] {msg}", chain.to_uppercase());
+            errors.push(msg);
+            let supply = partial_supply_after_fetch_fail(
+                chain,
+                &config,
+                from_block,
+                end_blk,
+                to_block_raw,
+                chunk_size,
+                metadata_call_pass,
+                historical_supply_pass,
+                &supply_start,
+                &supply_start_provenance,
+                &supply_end,
+                effective_decimals,
+                &win_start_ts,
+                &win_end_ts,
+                start_supply_block_ts.clone(),
+            );
+            let qa = build_qa_chain(&supply, generated_at, &errors);
+            return (empty_events, supply, qa, true);
+        }
     }
 
     let fetch_already_done = fetch_progress.as_ref().is_some_and(|p| p.is_complete());
 
     let mut events = if fetch_already_done {
-        match transfer_checkpoint::load_fetch_partial_events(out_dir, chain) {
+        match transfer_checkpoint::load_fetch_partial_events(
+            out_dir,
+            fetch_progress
+                .as_ref()
+                .expect("fetch_already_done implies progress"),
+        ) {
             Ok(e) => e,
             Err(e) => {
+                eprintln!("[{}] load partial transfers: {e:#}", chain.to_uppercase());
                 errors.push(format!("load partial transfers: {e:#}"));
                 hard_error = true;
                 Vec::new()
             }
         }
     } else if let Some(ref p) = fetch_progress {
-        match transfer_checkpoint::load_fetch_partial_events(out_dir, chain) {
+        match transfer_checkpoint::load_fetch_partial_events(out_dir, p) {
             Ok(e) => {
                 println!(
                     "[{}] resuming log fetch from block {} (chunk {}/{})",
@@ -1238,6 +1271,7 @@ pub(crate) async fn process_chain(
                 e
             }
             Err(e) => {
+                eprintln!("[{}] load partial transfers: {e:#}", chain.to_uppercase());
                 errors.push(format!("load partial transfers: {e:#}"));
                 hard_error = true;
                 Vec::new()
@@ -1294,8 +1328,27 @@ pub(crate) async fn process_chain(
         .unwrap_or(from_block);
 
     let mut logs_fetched: usize = fetch_progress.as_ref().map(|p| p.logs_fetched).unwrap_or(0);
-    let mut decode_errors = 0usize;
-    let mut qa_sample_done = fetch_already_done || fetch_progress.is_some();
+    let mut decode_errors: usize = fetch_progress
+        .as_ref()
+        .map(|p| p.decode_errors as usize)
+        .unwrap_or(0);
+    // Inclusive end of the last chunk known to be fetched; `from_block - 1` = nothing yet.
+    let last_through = std::cell::Cell::new(
+        fetch_progress
+            .as_ref()
+            .map(|p| p.last_fetched_through)
+            .unwrap_or(from_block - 1),
+    );
+    // Chunk-derived QA notes already committed (restored on resume so outputs match a fresh run).
+    let mut notes: Vec<String> = fetch_progress
+        .as_ref()
+        .map(|p| p.chunk_notes.clone())
+        .unwrap_or_default();
+    errors.extend(notes.iter().cloned());
+    // The decode-QA sample runs on the first non-empty chunk; it is done once any log was committed
+    // (its notes are restored from `chunk_notes`). An unresolved first-chunk progress has none.
+    let mut qa_sample_done =
+        fetch_already_done || fetch_progress.as_ref().is_some_and(|p| p.logs_fetched > 0);
 
     if !fetch_already_done && !hard_error {
         let chain_upper = chain.to_uppercase();
@@ -1329,6 +1382,7 @@ pub(crate) async fn process_chain(
                     ),
                 );
 
+                let mut new_notes: Vec<String> = Vec::new();
                 if !qa_sample_done && !logs.is_empty() {
                     let (_qa_n, _qa_fails, qa_errors) = sample_decode_qa(
                         logs,
@@ -1338,20 +1392,23 @@ pub(crate) async fn process_chain(
                         QA_SAMPLE_SIZE,
                     );
                     for e in qa_errors {
-                        errors.push(format!("decode QA: {e}"));
+                        new_notes.push(format!("decode QA: {e}"));
                     }
                     qa_sample_done = true;
                 }
 
+                // Counters are only advanced AFTER the progress file is durably saved, so the
+                // in-memory state is always the last committed state.
                 let mut chunk_events = Vec::with_capacity(logs.len());
+                let mut chunk_decode_errors = 0usize;
                 for log in logs {
                     match decode_transfer_log(log, &chain_owned, &contract_str, decimals_for_decode)
                     {
                         Ok(ev) => chunk_events.push(ev),
                         Err(e) => {
-                            decode_errors += 1;
-                            if decode_errors <= 5 {
-                                errors.push(format!("decode: {e:#}"));
+                            chunk_decode_errors += 1;
+                            if decode_errors + chunk_decode_errors <= 5 {
+                                new_notes.push(format!("decode: {e:#}"));
                             }
                         }
                     }
@@ -1361,9 +1418,8 @@ pub(crate) async fn process_chain(
                     &out_owned,
                     &chain_owned,
                     &chunk_events,
-                )?;
-                events.extend(chunk_events);
-                logs_fetched += logs.len();
+                )
+                .map_err(transfer_checkpoint::StorageError::wrap)?;
 
                 let progress = FetchChunkProgress {
                     schema: FetchChunkProgress::SCHEMA.to_string(),
@@ -1375,18 +1431,81 @@ pub(crate) async fn process_chain(
                     last_fetched_through: end,
                     chunks_done,
                     total_chunks,
-                    logs_fetched,
+                    logs_fetched: logs_fetched + logs.len(),
+                    events_persisted: (events.len() + chunk_events.len()) as u64,
+                    decode_errors: (decode_errors + chunk_decode_errors) as u64,
+                    unresolved: None,
+                    chunk_notes: notes.iter().chain(new_notes.iter()).cloned().collect(),
                 };
-                transfer_checkpoint::save_fetch_progress(&out_owned, &progress)?;
+                if let Err(e) = transfer_checkpoint::save_fetch_progress(&out_owned, &progress) {
+                    // Do NOT roll the CSV back: the error may have been returned after the new
+                    // progress file was already renamed into place. Either way the checkpoint is
+                    // resumable: rows beyond `last_fetched_through` are dropped on load.
+                    return Err(transfer_checkpoint::StorageError::wrap(e));
+                }
+                events.extend(chunk_events);
+                logs_fetched += logs.len();
+                decode_errors += chunk_decode_errors;
+                errors.extend(new_notes.iter().cloned());
+                notes.extend(new_notes);
+                last_through.set(end);
                 Ok(())
             },
         )
         .await;
 
         if let Err(e) = fetch_result {
-            let msg = format!("eth_getLogs failed: {e:#}");
-            eprintln!("[{}] {msg}", chain.to_uppercase());
-            errors.push(msg);
+            let is_storage = e
+                .downcast_ref::<transfer_checkpoint::StorageError>()
+                .is_some();
+            if is_storage {
+                // Local checkpoint I/O failed. Not an RPC failure: no unresolved interval is
+                // recorded and nothing more is written; the chunk is re-fetched on resume or,
+                // if its progress write actually landed, resumed after it.
+                let msg = format!(
+                    "checkpoint storage error (not an RPC failure; the on-disk progress is either the previous or the new committed state, both resumable): {e:#}"
+                );
+                eprintln!("[{}] {msg}", chain.to_uppercase());
+                errors.push(msg);
+            } else {
+                let msg = format!("eth_getLogs failed: {e:#}");
+                eprintln!("[{}] {msg}", chain.to_uppercase());
+                errors.push(msg.clone());
+                // Keep the failed interval explicit in the checkpoint; it is re-fetched first on
+                // resume. All counters here are the last committed values.
+                let next = last_through.get() + 1;
+                let progress = FetchChunkProgress {
+                    schema: FetchChunkProgress::SCHEMA.to_string(),
+                    chain: chain.to_string(),
+                    contract_address: contract_str.clone(),
+                    from_block,
+                    to_block: end_blk,
+                    chunk_size,
+                    last_fetched_through: last_through.get(),
+                    chunks_done: transfer_checkpoint::count_chunks(
+                        from_block,
+                        last_through.get(),
+                        chunk_size,
+                    ),
+                    total_chunks,
+                    logs_fetched,
+                    events_persisted: events.len() as u64,
+                    decode_errors: decode_errors as u64,
+                    unresolved: Some(transfer_checkpoint::UnresolvedInterval {
+                        from_block: next,
+                        to_block: next.saturating_add(chunk_size - 1).min(end_blk),
+                        error: msg,
+                    }),
+                    chunk_notes: notes.clone(),
+                };
+                if let Err(e) = transfer_checkpoint::save_fetch_progress(out_dir, &progress) {
+                    let warn = format!(
+                        "CHECKPOINT WARNING: could not record the unresolved interval ({e:#}); the progress file may or may not have been updated, but either state is resumable; the failed interval may not be recorded in it"
+                    );
+                    eprintln!("[{}] {warn}", chain.to_uppercase());
+                    errors.push(warn);
+                }
+            }
             let supply = partial_supply_after_fetch_fail(
                 chain,
                 &config,

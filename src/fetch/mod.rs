@@ -87,7 +87,11 @@ pub async fn fetch_transfer_logs_incremental<T: Transport + Clone>(
 }
 
 const LOG_FETCH_MAX_ATTEMPTS: u32 = 5;
+#[cfg(not(test))]
 const LOG_FETCH_RETRY_BASE_MS: u64 = 2000;
+/// Keep scripted-outage tests fast.
+#[cfg(test)]
+const LOG_FETCH_RETRY_BASE_MS: u64 = 1;
 
 async fn fetch_logs_with_retry<T: Transport + Clone>(
     provider: &impl Provider<T>,

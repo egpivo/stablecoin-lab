@@ -5,6 +5,8 @@ pub mod transfer_checkpoint;
 
 #[cfg(test)]
 mod mock_rpc;
+#[cfg(test)]
+mod resume_tests;
 
 #[cfg(test)]
 pub(crate) static RPC_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
