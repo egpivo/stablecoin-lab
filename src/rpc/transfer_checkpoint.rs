@@ -292,11 +292,13 @@ pub fn clear_chain_fetch_progress(out_dir: &Path, chain: &str) -> Result<()> {
         fetch_progress_path(out_dir, chain),
         fetch_partial_path(out_dir, chain),
     ] {
-        if p.exists() {
-            std::fs::remove_file(&p).ok();
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("remove {}", p.display()))),
         }
     }
-    Ok(())
+    sync_parent_dir(&fetch_progress_path(out_dir, chain))
 }
 
 pub fn load_manifest(out_dir: &Path) -> Result<Option<CheckpointManifest>> {
@@ -604,29 +606,6 @@ fn events_to_csv_bytes(events: &[TransferEvent], header: bool) -> Result<Vec<u8>
         .map_err(|e| anyhow::anyhow!("csv buffer: {e}"))
 }
 
-/// Current byte length of the partial CSV (0 if absent). Used to roll back an uncommitted append.
-pub fn partial_len(out_dir: &Path, chain: &str) -> u64 {
-    std::fs::metadata(fetch_partial_path(out_dir, chain))
-        .map(|m| m.len())
-        .unwrap_or(0)
-}
-
-/// Cut the partial CSV back to `len` bytes (removing it when `len == 0`) and fsync.
-pub fn truncate_partial(out_dir: &Path, chain: &str, len: u64) -> Result<()> {
-    let path = fetch_partial_path(out_dir, chain);
-    if !path.exists() {
-        return Ok(());
-    }
-    if len == 0 {
-        std::fs::remove_file(&path)?;
-        return sync_parent_dir(&path);
-    }
-    let f = OpenOptions::new().write(true).open(&path)?;
-    f.set_len(len)?;
-    f.sync_all()?;
-    Ok(())
-}
-
 /// Load and validate the in-flight partial events for `progress`.
 ///
 /// * restores `value_u256` from `value_raw`;
@@ -814,11 +793,10 @@ pub fn save_completed_chain(
 ) -> Result<()> {
     let root = checkpoint_root(out_dir);
     std::fs::create_dir_all(&root)?;
-    #[cfg(test)]
-    if fault::hit(&root, fault::Op::Stage(4)) {
-        anyhow::bail!("injected failure at completed-chain stage 4 (cleanup)");
-    }
-    clear_chain_fetch_progress(out_dir, chain)?;
+    // Order matters for crash safety: (1) final transfers CSV, (2) chain bundle, (3) the manifest
+    // entry that declares the chain complete (the commit point), (4) only then drop the in-flight
+    // fetch progress. A failure before (3) leaves the fetch progress intact, so resume redoes the
+    // cheap tail; a failure at (4) leaves stale files that the completed manifest makes irrelevant.
     #[cfg(test)]
     if fault::hit(&root, fault::Op::Stage(1)) {
         anyhow::bail!("injected failure at completed-chain stage 1 (transfers csv)");
@@ -840,6 +818,11 @@ pub fn save_completed_chain(
         manifest.completed_chains.sort();
     }
     save_manifest(out_dir, manifest)?;
+    #[cfg(test)]
+    if fault::hit(&root, fault::Op::Stage(4)) {
+        anyhow::bail!("injected failure at completed-chain stage 4 (cleanup)");
+    }
+    clear_chain_fetch_progress(out_dir, chain)?;
     println!(
         "[{}] chain checkpoint saved ({} transfer rows) — safe to stop; re-run same --run-id to resume",
         chain.to_uppercase(),

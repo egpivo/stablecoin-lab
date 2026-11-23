@@ -1319,7 +1319,10 @@ pub(crate) async fn process_chain(
         .map(|p| p.chunk_notes.clone())
         .unwrap_or_default();
     errors.extend(notes.iter().cloned());
-    let mut qa_sample_done = fetch_already_done || fetch_progress.is_some();
+    // The decode-QA sample runs on the first non-empty chunk; it is done once any log was committed
+    // (its notes are restored from `chunk_notes`). An unresolved first-chunk progress has none.
+    let mut qa_sample_done =
+        fetch_already_done || fetch_progress.as_ref().is_some_and(|p| p.logs_fetched > 0);
 
     if !fetch_already_done && !hard_error {
         let chain_upper = chain.to_uppercase();
@@ -1385,7 +1388,6 @@ pub(crate) async fn process_chain(
                     }
                 }
 
-                let pre_len = transfer_checkpoint::partial_len(&out_owned, &chain_owned);
                 transfer_checkpoint::append_fetch_partial_events(
                     &out_owned,
                     &chain_owned,
@@ -1410,9 +1412,9 @@ pub(crate) async fn process_chain(
                     chunk_notes: notes.iter().chain(new_notes.iter()).cloned().collect(),
                 };
                 if let Err(e) = transfer_checkpoint::save_fetch_progress(&out_owned, &progress) {
-                    // Un-commit the appended rows; the chunk is fetched again on resume.
-                    let _ =
-                        transfer_checkpoint::truncate_partial(&out_owned, &chain_owned, pre_len);
+                    // Do NOT roll the CSV back: the error may have been returned after the new
+                    // progress file was already renamed into place. Either way the checkpoint is
+                    // resumable: rows beyond `last_fetched_through` are dropped on load.
                     return Err(transfer_checkpoint::StorageError::wrap(e));
                 }
                 events.extend(chunk_events);
@@ -1432,10 +1434,10 @@ pub(crate) async fn process_chain(
                 .is_some();
             if is_storage {
                 // Local checkpoint I/O failed. Not an RPC failure: no unresolved interval is
-                // recorded and nothing more is written; the on-disk checkpoint stays at the last
-                // committed state and the chunk is re-fetched on resume.
+                // recorded and nothing more is written; the chunk is re-fetched on resume or,
+                // if its progress write actually landed, resumed after it.
                 let msg = format!(
-                    "checkpoint storage error (not an RPC failure; checkpoint left at last committed state): {e:#}"
+                    "checkpoint storage error (not an RPC failure; the on-disk progress is either the previous or the new committed state, both resumable): {e:#}"
                 );
                 eprintln!("[{}] {msg}", chain.to_uppercase());
                 errors.push(msg);
@@ -1472,7 +1474,7 @@ pub(crate) async fn process_chain(
                 };
                 if let Err(e) = transfer_checkpoint::save_fetch_progress(out_dir, &progress) {
                     let warn = format!(
-                        "CHECKPOINT WARNING: could not record the unresolved interval ({e:#}); the on-disk checkpoint is unchanged and still safe to resume, but the failed interval is not recorded in it"
+                        "CHECKPOINT WARNING: could not record the unresolved interval ({e:#}); the progress file may or may not have been updated, but either state is resumable; the failed interval may not be recorded in it"
                     );
                     eprintln!("[{}] {warn}", chain.to_uppercase());
                     errors.push(warn);

@@ -1497,3 +1497,53 @@ async fn fault_matrix_sweep_recovers_identically() {
     println!("fault matrix: {identical} faulted runs recovered byte-identically");
     assert!(identical >= 50);
 }
+
+fn diff_names(a: &Path, b: &Path) -> Vec<String> {
+    let (fa, fb) = (files_in(a), files_in(b));
+    let mut out = vec![];
+    for (n, x) in &fa {
+        match fb.iter().find(|y| &y.0 == n) {
+            Some(y) if y.1 == *x => {}
+            Some(y) => out.push(format!("DIFF {n} ({} vs {} bytes)", x.len(), y.1.len())),
+            None => out.push(format!("MISSING {n}")),
+        }
+    }
+    out
+}
+
+/// KNOWN ISSUE, not fixed in this PR: when a run resumes through the completed-chain LOAD path
+/// (chain already committed in the manifest), outputs derived from `#[serde(skip)]` fields of
+/// `SupplyAuditRow` (e.g. supply_snapshots.csv) differ from an uninterrupted run. Run explicitly with
+/// `cargo test -- --ignored completed_chain_load_path_known_divergence`.
+#[tokio::test]
+#[ignore = "known pre-existing issue in the completed-chain load path; tracked in egpivo/stablecoin-lab#14"]
+async fn completed_chain_load_path_known_divergence() {
+    let env = Env::new().await;
+    env.bad_only(BAD_CHUNK);
+    let a = uninterrupted("kd_a").await;
+    let b = tmp_root("kd_b");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    let root = ckpt::checkpoint_root(&dir);
+    fault::arm(&root, Op::Stage(4), 0);
+    assert!(run_scan(&b, CHUNK).await.is_err());
+    fault::disarm(&root);
+    run_scan(&b, CHUNK).await.expect("resume");
+    let d = diff_names(&run_dir(&a), &dir);
+    println!("KNOWN-DIVERGENCE diffs: {d:?}");
+    println!(
+        "uninterrupted supply_snapshots.csv:\n{}",
+        read(&run_dir(&a).join("supply_snapshots.csv"))
+    );
+    println!(
+        "resumed supply_snapshots.csv ({} bytes):\n{}",
+        std::fs::metadata(dir.join("supply_snapshots.csv"))
+            .unwrap()
+            .len(),
+        read(&dir.join("supply_snapshots.csv"))
+    );
+    assert!(
+        d.is_empty(),
+        "outputs diverge on the completed-chain load path: {d:?}"
+    );
+}
