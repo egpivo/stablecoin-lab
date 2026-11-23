@@ -24,6 +24,7 @@ Index for CLI, benchmarks, product specs, and research. [Root README](../README.
 | `stablecoin-map-package` | Map CSVs from benchmarks (+ optional network sources) |
 
 Resume: same `--run-id` + `--window` uses `checkpoint/`; `--fresh` clears. `--chunk-size` default 500; 5 RPC retries.
+Details, guarantees and the v1-to-v2 progress schema break: [CHECKPOINT_RESUME.md](CHECKPOINT_RESUME.md).
 
 Experimental (`--features experimental`): `fetch`, `report`, `control-audit`, `control-report`.
 

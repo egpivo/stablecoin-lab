@@ -1187,6 +1187,7 @@ async fn value_raw_u256_boundaries() {
         events_persisted: n,
         decode_errors: 0,
         unresolved: None,
+        chunk_notes: Vec::new(),
     };
     let two128 = "340282366920938463463374607431768211456";
     let max = U256::MAX.to_string();
@@ -1222,4 +1223,25 @@ async fn counter_contradictions_are_rejected() {
     });
     let e = err_text(load_progress(&root));
     assert!(e.contains("events_persisted"), "{e}");
+}
+
+/// A failed fallback (unresolved-interval) save is loud in qa_report, and the checkpoint stays resumable.
+#[tokio::test]
+async fn failed_fallback_save_is_reported_loudly_and_stays_resumable() {
+    let env = Env::new().await;
+    let a = uninterrupted("fb_a").await;
+    let b = tmp_root("fb_b");
+    seed_manifest(&b, CHUNK);
+    let dir = run_dir(&b);
+    env.fail_from(FROM + 300);
+    // saves 0..=2 succeed (chunks 0..2); the fallback unresolved-interval save is the 4th
+    fault::arm(&dir, Op::SaveProgress, 3);
+    assert!(run_scan(&b, CHUNK).await.is_err());
+    fault::disarm(&dir);
+    let qa = read(&dir.join("qa_report.json"));
+    assert!(qa.contains("CHECKPOINT WARNING"), "{qa}");
+    counters_ok(&b);
+    env.fail_from(0);
+    run_scan(&b, CHUNK).await.expect("resume");
+    assert_same_outputs(&run_dir(&a), &run_dir(&b));
 }

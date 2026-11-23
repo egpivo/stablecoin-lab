@@ -84,6 +84,10 @@ pub struct FetchChunkProgress {
     /// and is re-fetched first on resume. `None` when the last stop was not an RPC failure.
     #[serde(default)]
     pub unresolved: Option<UnresolvedInterval>,
+    /// Chunk-derived QA notes (decode QA sample + first decode errors), in order, so a resumed run
+    /// reports the same `qa_report.json` / manifest warnings as an uninterrupted one.
+    #[serde(default)]
+    pub chunk_notes: Vec<String>,
 }
 
 /// Inclusive block interval that could not be fetched; kept explicit in the checkpoint.
@@ -132,6 +136,25 @@ pub fn fetch_partial_path(out_dir: &Path, chain: &str) -> PathBuf {
     checkpoint_root(out_dir).join(format!("fetch_partial_{chain}.csv"))
 }
 
+/// Local checkpoint I/O failure (as opposed to an RPC failure). Carried through the fetch loop so
+/// callers can tell the two apart.
+#[derive(Debug)]
+pub struct StorageError(pub String);
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl StorageError {
+    pub fn wrap(e: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(StorageError(format!("{e:#}")))
+    }
+}
+
 /// Test-only fault injection, scoped by path prefix so parallel tests cannot interfere.
 #[cfg(test)]
 pub(crate) mod fault {
@@ -144,7 +167,7 @@ pub(crate) mod fault {
         SaveProgress,
         /// `append_fetch_partial_events` returns Err before writing anything.
         Append,
-        /// `append_fetch_partial_events` writes half the bytes, then returns Err (torn tail).
+        /// `append_fetch_partial_events` writes half the bytes, then returns Err without cleanup (simulated crash, torn tail).
         TornAppend,
         /// `write_atomic` writes the tmp file, then fails before the rename.
         Rename,
@@ -192,10 +215,18 @@ pub(crate) mod fault {
 
 /// Write via temp file + rename so a crash never leaves a half-written JSON checkpoint.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+    {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
     #[cfg(test)]
     if fault::hit(path, fault::Op::Rename) {
         anyhow::bail!(
@@ -204,6 +235,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         );
     }
     std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    sync_parent_dir(path)
+}
+
+/// fsync the directory so a completed rename/create survives a crash.
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        let d = std::fs::File::open(dir).with_context(|| format!("open dir {}", dir.display()))?;
+        d.sync_all()
+            .with_context(|| format!("fsync dir {}", dir.display()))?;
+    }
     Ok(())
 }
 
@@ -407,6 +448,25 @@ fn validate_progress_consistency(p: &FetchChunkProgress, path: &Path) -> Result<
             p.chunks_done, p.total_chunks, want_done, want_total
         ));
     }
+    if p.decode_errors > p.logs_fetched as u64 {
+        return bad(format!(
+            "decode_errors {} > logs_fetched {}",
+            p.decode_errors, p.logs_fetched
+        ));
+    }
+    if p.events_persisted > p.logs_fetched as u64 {
+        return bad(format!(
+            "events_persisted {} > logs_fetched {}",
+            p.events_persisted, p.logs_fetched
+        ));
+    }
+    // Every fetched log yields exactly one decoded event or one decode error.
+    if p.events_persisted + p.decode_errors != p.logs_fetched as u64 {
+        return bad(format!(
+            "events_persisted {} + decode_errors {} != logs_fetched {}",
+            p.events_persisted, p.decode_errors, p.logs_fetched
+        ));
+    }
     if let Some(u) = &p.unresolved {
         if p.is_complete() {
             return bad("window marked complete but has an unresolved interval".into());
@@ -482,8 +542,13 @@ fn restore_event(mut ev: TransferEvent, row: usize, path: &Path) -> Result<Trans
 }
 
 fn read_events_csv(path: &Path) -> Result<Vec<TransferEvent>> {
+    let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
+    parse_events_csv(&bytes, path)
+}
+
+fn parse_events_csv(bytes: &[u8], path: &Path) -> Result<Vec<TransferEvent>> {
     let mut events = Vec::new();
-    let mut rdr = csv::Reader::from_path(path).with_context(|| path.display().to_string())?;
+    let mut rdr = csv::Reader::from_reader(bytes);
     for (i, row) in rdr.deserialize::<TransferEvent>().enumerate() {
         let ev = row.with_context(|| {
             format!(
@@ -495,6 +560,40 @@ fn read_events_csv(path: &Path) -> Result<Vec<TransferEvent>> {
         events.push(restore_event(ev, i + 1, path)?);
     }
     Ok(events)
+}
+
+fn events_to_csv_bytes(events: &[TransferEvent], header: bool) -> Result<Vec<u8>> {
+    let mut wtr = csv::WriterBuilder::new()
+        .has_headers(header)
+        .from_writer(Vec::new());
+    for ev in events {
+        wtr.serialize(ev)?;
+    }
+    wtr.into_inner()
+        .map_err(|e| anyhow::anyhow!("csv buffer: {e}"))
+}
+
+/// Current byte length of the partial CSV (0 if absent). Used to roll back an uncommitted append.
+pub fn partial_len(out_dir: &Path, chain: &str) -> u64 {
+    std::fs::metadata(fetch_partial_path(out_dir, chain))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Cut the partial CSV back to `len` bytes (removing it when `len == 0`) and fsync.
+pub fn truncate_partial(out_dir: &Path, chain: &str, len: u64) -> Result<()> {
+    let path = fetch_partial_path(out_dir, chain);
+    if !path.exists() {
+        return Ok(());
+    }
+    if len == 0 {
+        std::fs::remove_file(&path)?;
+        return sync_parent_dir(&path);
+    }
+    let f = OpenOptions::new().write(true).open(&path)?;
+    f.set_len(len)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Load and validate the in-flight partial events for `progress`.
@@ -519,7 +618,20 @@ pub fn load_fetch_partial_events(
             progress.events_persisted
         );
     }
-    let all = read_events_csv(&path)?;
+    // A chunk's rows are written with a single append that ends in a newline, and the progress file
+    // is saved only after that append is fsynced. A final line without a newline is therefore a torn
+    // append of an UNcommitted chunk: drop it (it is fetched again). Anything else wrong still fails.
+    let bytes = std::fs::read(&path).with_context(|| path.display().to_string())?;
+    let torn = !bytes.is_empty() && !bytes.ends_with(b"\n");
+    let usable: &[u8] = if torn {
+        match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(i) => &bytes[..=i],
+            None => &[],
+        }
+    } else {
+        &bytes
+    };
+    let all = parse_events_csv(usable, &path)?;
     let total = all.len();
     let mut kept = Vec::with_capacity(total);
     for (i, ev) in all.into_iter().enumerate() {
@@ -559,7 +671,7 @@ pub fn load_fetch_partial_events(
             progress.events_persisted
         );
     }
-    if kept.len() != total {
+    if kept.len() != total || torn {
         rewrite_partial(&path, &kept)?;
     }
     Ok(kept)
@@ -568,54 +680,45 @@ pub fn load_fetch_partial_events(
 fn rewrite_partial(path: &Path, events: &[TransferEvent]) -> Result<()> {
     if events.is_empty() {
         std::fs::remove_file(path)?; // append recreates it with a header
-        return Ok(());
+        return sync_parent_dir(path);
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut wtr = csv::Writer::from_path(&tmp)?;
-        for ev in events {
-            wtr.serialize(ev)?;
-        }
-        wtr.flush()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    write_atomic(path, &events_to_csv_bytes(events, true)?)
 }
 
+/// Append one chunk's rows with a single write + fsync. On a real write error the file is cut back
+/// to its previous length so a short write cannot poison the checkpoint.
 pub fn append_fetch_partial_events(
     out_dir: &Path,
     chain: &str,
     new_rows: &[TransferEvent],
 ) -> Result<()> {
+    use std::io::Write;
     if new_rows.is_empty() {
         return Ok(());
     }
     std::fs::create_dir_all(checkpoint_root(out_dir))?;
     let path = fetch_partial_path(out_dir, chain);
-    let file_exists = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let pre_len = path.metadata().map(|m| m.len()).unwrap_or(0);
+    let bytes = events_to_csv_bytes(new_rows, pre_len == 0)?;
     #[cfg(test)]
     if fault::hit(&path, fault::Op::Append) {
         anyhow::bail!("injected partial CSV append failure");
     }
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     #[cfg(test)]
-    let torn = fault::hit(&path, fault::Op::TornAppend);
-    let mut wtr = csv::WriterBuilder::new()
-        .has_headers(!file_exists)
-        .from_writer(&mut file);
-    for ev in new_rows {
-        wtr.serialize(ev)?;
-    }
-    wtr.flush()?;
-    #[cfg(test)]
-    if torn {
-        drop(wtr);
-        let len = file.metadata()?.len();
-        let keep = len.saturating_sub(40);
-        file.set_len(keep)?; // cut inside the last appended row
+    if fault::hit(&path, fault::Op::TornAppend) {
+        // Simulated crash mid-write: half the bytes land, no cleanup runs.
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        file.sync_all()?;
         anyhow::bail!("injected torn partial CSV append");
+    }
+    let res = file.write_all(&bytes).and_then(|_| file.sync_all());
+    if let Err(e) = res {
+        let _ = file.set_len(pre_len);
+        return Err(anyhow::Error::new(e).context(format!("append {}", path.display())));
+    }
+    if pre_len == 0 {
+        sync_parent_dir(&path)?;
     }
     Ok(())
 }
@@ -682,11 +785,7 @@ pub fn save_completed_chain(
     std::fs::create_dir_all(&root)?;
     clear_chain_fetch_progress(out_dir, chain)?;
     let csv_path = transfers_path(out_dir, chain);
-    let mut wtr = csv::Writer::from_path(&csv_path)?;
-    for ev in events {
-        wtr.serialize(ev)?;
-    }
-    wtr.flush()?;
+    write_atomic(&csv_path, &events_to_csv_bytes(events, true)?)?;
     let json_path = chain_bundle_path(out_dir, chain);
     write_atomic(&json_path, serde_json::to_string_pretty(bundle)?.as_bytes())?;
     if !manifest.completed_chains.iter().any(|c| c == chain) {
@@ -820,6 +919,7 @@ mod tests {
             events_persisted: 10,
             decode_errors: 0,
             unresolved: None,
+            chunk_notes: Vec::new(),
         };
         assert_eq!(p.resume_from_block(), 500);
         assert!(!p.is_complete());
@@ -879,6 +979,7 @@ mod tests {
             events_persisted: 3,
             decode_errors: 0,
             unresolved: None,
+            chunk_notes: Vec::new(),
         };
         save_fetch_progress(&out, &progress).unwrap();
         let loaded = load_fetch_progress(&out, "ethereum", "0xabcdef", 1, 10, 5)
@@ -912,6 +1013,7 @@ mod tests {
             events_persisted: 2,
             decode_errors: 0,
             unresolved: None,
+            chunk_notes: Vec::new(),
         };
         let rows = load_fetch_partial_events(&out, &progress).unwrap();
         assert_eq!(rows.len(), 2);
