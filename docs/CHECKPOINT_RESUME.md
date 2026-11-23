@@ -49,15 +49,14 @@ v3 requires `chunk_notes` (no default) and validates it against `decode_errors`:
 Other v3 validation: `events_persisted + decode_errors == logs_fetched`, chunk-boundary and counter
 consistency, window/contract match.
 
-Completed-chain checkpoints (`transfers_<chain>.csv`, `chain_<chain>.json`, `manifest.json`) keep their
-schema, but completed-chain CSVs are cross-checked against their bundle (row count, mint/burn sums).
+Completed-chain bundles (`chain_<chain>.json`) are schema v2 (`bundle_schema: 2`): besides `supply` and
+`qa` they carry `supply_unpersisted`, the five `#[serde(skip)]` `SupplyAuditRow` fields (raw total supply
+at start/end and the three block timestamps) that `supply_audit.csv` deliberately omits but
+`supply_snapshots.csv` and `artifact_manifest.json` need. Bundles without `bundle_schema` (written by
+older builds) fail closed on load with a message to re-run with `--fresh`; they are never resumed from.
+`transfers_<chain>.csv` and `manifest.json` keep their schema, and completed-chain CSVs are cross-checked against their bundle (row count, mint/burn sums).
 Runs finished with the old resume code are not repaired; re-run or flag any whose supply invariant
 failed after a resume.
 
 Stale partial rows with no valid progress file are cleared before a fresh fetch; if they cannot be
 cleared the run stops with an error naming the path (it never fetches on top of them).
-
-## Known issue
-
-Resuming through the completed-chain load path yields an empty `supply_snapshots.csv` and a different
-`artifact_manifest.json` (tracked in egpivo/stablecoin-lab#14, not fixed here).
